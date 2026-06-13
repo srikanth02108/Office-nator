@@ -1,0 +1,114 @@
+{
+  "name": "Sutra Desktop Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "sutra",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [250, 300],
+      "webhookId": "sutra-webhook"
+    },
+    {
+      "parameters": {
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=YOUR_GEMINI_API_KEY_HERE",
+        "authentication": "none",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ contents: [{ parts: [{ text: `You are an AI desktop actuator for Microsoft Excel on Windows. The user speaks in natural language (possibly translated from Hindi/Marathi). Extract the FINAL intended action from their (possibly messy) thought process.\n\nBreak it down into a JSON object with this EXACT structure:\n{\n  \"plan\": \"<human-readable description of what you will do>\",\n  \"requires_confirmation\": <true if destructive action like delete/clear/format-all, false otherwise>,\n  \"steps\": [\n    {\"action\": \"<action_type>\", ...params}\n  ]\n}\n\nAllowed action types:\n- \"hotkey\": {\"action\": \"hotkey\", \"keys\": [\"ctrl\", \"b\"]} — press keyboard shortcut\n- \"type_text\": {\"action\": \"type_text\", \"text\": \"hello\"} — type text\n- \"click\": {\"action\": \"click\", \"target\": \"element_name\"} — click UI element\n- \"wait\": {\"action\": \"wait\", \"seconds\": 1} — pause between actions\n\nCommon Excel keyboard shortcuts you should use:\n- Bold: Ctrl+B\n- Italic: Ctrl+I\n- Underline: Ctrl+U\n- Copy: Ctrl+C\n- Paste: Ctrl+V\n- Cut: Ctrl+X\n- Undo: Ctrl+Z\n- Redo: Ctrl+Y\n- Save: Ctrl+S\n- Select All: Ctrl+A\n- Find: Ctrl+F\n- Replace: Ctrl+H\n- Insert Row: first select row with Shift+Space, then Ctrl+Shift++\n- Delete Row: first select row with Shift+Space, then Ctrl+-\n- Go to cell A1: Ctrl+Home\n- Go to last cell: Ctrl+End\n- New Sheet: Shift+F11\n- Next Sheet: Ctrl+PageDown\n- Previous Sheet: Ctrl+PageUp\n- Format Cells dialog: Ctrl+1\n- AutoSum: Alt+=\n- Insert function: Shift+F3\n- Toggle filter: Ctrl+Shift+L\n- Create table: Ctrl+T\n- Insert chart: Alt+F1\n- Navigate to cell: Ctrl+G then type cell reference\n- Fill down: Ctrl+D\n- Fill right: Ctrl+R\n- Enter formula: type = then formula then Enter\n- Wrap text: Alt+H then W\n- Merge cells: Alt+H then M then M\n- Center align: Ctrl+E\n- Left align: Ctrl+L\n- Right align: Ctrl+R\n\nIf the user mentions \"undo\" or \"go back\", return: {\"plan\": \"Undoing last action\", \"requires_confirmation\": false, \"steps\": [{\"action\": \"hotkey\", \"keys\": [\"ctrl\", \"z\"]}]}\n\nIf the intent is unclear, set requires_confirmation to true and explain in the plan what you think they want.\n\nUser context: ${$json.body.context || 'None'}\n\nUser command: ${$json.body.user_text}\n\nReturn ONLY valid JSON. No markdown, no code fences, no explanation.` }] }], generationConfig: { temperature: 0.1, maxOutputTokens: 1024 } }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": false
+            }
+          }
+        }
+      },
+      "id": "gemini-request",
+      "name": "Gemini API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [500, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract the text response from Gemini and parse it as JSON\nconst geminiResponse = $input.first().json;\n\n// Navigate Gemini's response structure\nlet text = '';\ntry {\n  text = geminiResponse.candidates[0].content.parts[0].text;\n} catch (e) {\n  return [{ json: {\n    plan: 'Error: Could not parse Gemini response',\n    requires_confirmation: false,\n    steps: []\n  }}];\n}\n\n// Clean up: remove markdown code fences if present\ntext = text.replace(/```json\\n?/g, '').replace(/```\\n?/g, '').trim();\n\n// Parse the JSON\ntry {\n  const parsed = JSON.parse(text);\n  \n  // Validate structure\n  const result = {\n    plan: parsed.plan || 'Executing command...',\n    requires_confirmation: parsed.requires_confirmation || false,\n    steps: Array.isArray(parsed.steps) ? parsed.steps : []\n  };\n  \n  return [{ json: result }];\n} catch (e) {\n  return [{ json: {\n    plan: `Error parsing LLM output: ${text.substring(0, 200)}`,\n    requires_confirmation: false,\n    steps: []\n  }}];\n}"
+      },
+      "id": "parse-json",
+      "name": "Parse JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [750, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              }
+            ]
+          }
+        }
+      },
+      "id": "respond-webhook",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1000, 300]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Gemini API",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini API": {
+      "main": [
+        [
+          {
+            "node": "Parse JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse JSON": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": [],
+  "triggerCount": 0,
+  "pinData": {}
+}

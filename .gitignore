@@ -1,0 +1,42 @@
+# ── Secrets ──────────────────────────────────────────────
+.env
+*.env.*
+!.env.example
+
+# ── Python ───────────────────────────────────────────────
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Test / temp scripts ───────────────────────────────────
+test_gemini.py
+test_pipeline.py
+update_gemini_key.py
+
+# ── Audio test files ──────────────────────────────────────
+ears/test_output.wav
+*.wav
+
+# ── Torch hub cache ───────────────────────────────────────
+.cache/
+
+# ── Node / Next.js ────────────────────────────────────────
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.env.local
+frontend/.env.development.local
+frontend/.env.test.local
+frontend/.env.production.local
+
+# ── OS ────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini

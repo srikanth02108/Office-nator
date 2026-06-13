@@ -1,0 +1,36 @@
+# Sutra — Python Dependencies
+# Install with: pip install -r requirements.txt
+# NOTE: PyAudio on Windows may need: pip install pipwin && pipwin install pyaudio
+
+# Audio capture & playback
+pyaudio
+numpy
+
+# HTTP client (Sarvam STT, n8n webhook)
+requests
+
+# Desktop automation
+pyautogui
+pyperclip
+
+# Silero VAD — loaded at runtime via torch.hub (no pip package needed)
+torch
+torchaudio
+
+# Sarvam AI STT SDK
+sarvamai
+
+# Text-to-speech
+edge-tts
+
+# Hotkey listener
+keyboard
+
+# Image processing (PyAutoGUI screen search)
+Pillow
+opencv-python
+
+# API server (frontend bridge)
+fastapi
+uvicorn[standard]
+packaging
