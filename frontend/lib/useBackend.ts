@@ -2,8 +2,8 @@
 
 import { useCallback, useEffect, useRef, useState } from "react"
 
-const WS_URL = "ws://localhost:8000/ws"
-const API_URL = "http://localhost:8000"
+const WS_URL = (process.env.NEXT_PUBLIC_WS_URL ?? "ws://localhost:8000") + "/ws"
+const API_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000"
 
 export type AgentStatus = "idle" | "listening" | "processing" | "executing"
 
