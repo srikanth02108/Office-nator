@@ -32,11 +32,15 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 SARVAM_API_KEY: str = os.environ.get("SARVAM_API_KEY", "")
 GEMINI_API_KEY: str = os.environ.get("GEMINI_API_KEY", "")
+GROQ_API_KEY:   str = os.environ.get("GROQ_API_KEY", "")
+
+# LLM provider: "groq" (recommended) or "gemini"
+LLM_PROVIDER: str = os.environ.get("LLM_PROVIDER", "groq")
 
 if not SARVAM_API_KEY:
     logger.warning("SARVAM_API_KEY not set — STT will not work")
-if not GEMINI_API_KEY:
-    logger.warning("GEMINI_API_KEY not set — brain will not work")
+if not GROQ_API_KEY and not GEMINI_API_KEY:
+    logger.warning("Neither GROQ_API_KEY nor GEMINI_API_KEY set — brain will not work")
 
 # ---------------------------------------------------------------------------
 # n8n Configuration

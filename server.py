@@ -306,6 +306,15 @@ def run_listen_cycle():
         if success:
             speaker.speak("Done!")
             emit({"type": "done", "plan": plan_text})
+            # Learn from this interaction — extract preferences in background
+            threading.Thread(
+                target=lambda: memory.save_from_conversation(english_text, plan_text),
+                daemon=True,
+            ).start()
+            # Update memories in state for frontend
+            with state._lock:
+                state.memories = memory.get_all_memories()
+            asyncio.run_coroutine_threadsafe(broadcast_state(), loop)
         else:
             speaker.speak("Some steps failed.")
             emit({"type": "error", "message": "Some steps failed"})
@@ -426,7 +435,10 @@ async def startup():
     logger.info("✅ TTSSpeaker ready")
 
     memory = MemoryManager()
-    logger.info("✅ MemoryManager ready")
+    logger.info("✅ MemoryManager ready (%d memories)", memory.memory_count())
+
+    # Populate initial memory state for frontend
+    state.memories = memory.get_all_memories()
 
     logger.info("🚀 Sutra server ready at http://localhost:8000")
     logger.info("   WebSocket: ws://localhost:8000/ws")

@@ -159,14 +159,34 @@ class Actuator:
         return True
 
     def execute_hotkey(self, step: Dict[str, Any]) -> bool:
-        """Press a keyboard shortcut."""
+        """Press a keyboard shortcut.
+        
+        Handles both true simultaneous hotkeys (ctrl+b) and sequential
+        ribbon key presses (alt+h then f then s — each pressed separately).
+        Keys with 1 character that are NOT modifier keys are pressed sequentially.
+        """
         keys: List[str] = step.get("keys", [])
         if not keys:
             logger.warning("No keys specified for hotkey action")
             return False
 
-        pyautogui.hotkey(*keys)
-        logger.info(f"Hotkey: {'+'.join(keys)}")
+        MODIFIERS = {"ctrl", "alt", "shift", "win", "command", "option"}
+
+        # If all keys are single chars AND none are modifiers → sequential press
+        # e.g. ["f", "s"] from Alt+H ribbon navigation
+        all_single = all(len(k) == 1 for k in keys)
+        has_modifier = any(k.lower() in MODIFIERS for k in keys)
+
+        if all_single and not has_modifier and len(keys) > 1:
+            # Sequential key presses (ribbon shortcut keys)
+            for k in keys:
+                pyautogui.press(k)
+                time.sleep(0.05)
+            logger.info(f"Sequential keys: {' → '.join(keys)}")
+        else:
+            # True simultaneous hotkey
+            pyautogui.hotkey(*keys)
+            logger.info(f"Hotkey: {'+'.join(keys)}")
         return True
 
     def execute_wait(self, step: Dict[str, Any]) -> bool:
