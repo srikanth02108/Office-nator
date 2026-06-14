@@ -8,6 +8,8 @@ import { TranscriptTerminal, type TranscriptLine } from "./transcript-terminal"
 import { AgentBrain } from "./agent-brain"
 import { ProviderPanel } from "./provider-panel"
 import { useBackend } from "@/lib/useBackend"
+import { useSession } from "@/lib/useSession"
+import { UserBadge } from "./user-badge"
 import type { AgentState } from "./voice-interface"
 
 export function Dashboard() {
@@ -16,6 +18,8 @@ export function Dashboard() {
     startListening, stopListening, triggerUndo,
     setProvider, setApiKey, setCustomProvider,
   } = useBackend()
+
+  const { user, logout } = useSession()
 
   const agentState: AgentState = state.status as AgentState
 
@@ -104,6 +108,8 @@ export function Dashboard() {
             <Cpu className="h-3.5 w-3.5 text-primary" />
             {state.command_count} cmds
           </div>
+
+          {user && <UserBadge user={user} logout={logout} />}
         </div>
       </header>
 
