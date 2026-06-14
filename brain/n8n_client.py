@@ -352,19 +352,35 @@ class N8NClient:
         }
         if force_json:
             payload["response_format"] = {"type": "json_object"}
-        try:
-            r = requests.post(url, headers=headers, json=payload, timeout=15)
-            r.raise_for_status()
-            data = r.json()
-            raw = data["choices"][0]["message"]["content"]
-            u = data.get("usage", {})
-            usage.record(provider_name,
-                u.get("prompt_tokens", len(user_text)//4),
-                u.get("completion_tokens", len(raw)//4))
-            return self._parse_intent(raw)
-        except Exception as e:
-            logger.error("%s failed: %s", provider_name, e)
-            return None
+
+        # Retry once on 429 with backoff
+        for attempt in range(2):
+            try:
+                r = requests.post(url, headers=headers, json=payload, timeout=20)
+                if r.status_code == 429:
+                    retry_after = int(r.headers.get("retry-after", "5"))
+                    wait = min(retry_after, 8)
+                    logger.warning("%s rate limited, waiting %ds (attempt %d)", provider_name, wait, attempt + 1)
+                    import time; time.sleep(wait)
+                    continue
+                r.raise_for_status()
+                data = r.json()
+                raw = data["choices"][0]["message"]["content"]
+                u = data.get("usage", {})
+                usage.record(provider_name,
+                    u.get("prompt_tokens", len(user_text)//4),
+                    u.get("completion_tokens", len(raw)//4))
+                return self._parse_intent(raw)
+            except requests.exceptions.HTTPError as e:
+                if e.response is not None and e.response.status_code == 429 and attempt == 0:
+                    import time; time.sleep(5)
+                    continue
+                logger.error("%s failed: %s", provider_name, e)
+                return None
+            except Exception as e:
+                logger.error("%s failed: %s", provider_name, e)
+                return None
+        return None
 
     def _call_gemini(self, user_text: str, context: str) -> Optional[dict]:
         key = provider_config.keys.get("gemini", GEMINI_API_KEY)
@@ -406,34 +422,25 @@ class N8NClient:
 
 # ── Standalone test ───────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    import time as _time
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s [%(levelname)s] %(name)s — %(message)s")
 
     client = N8NClient()
+    # Test just a few to avoid rate limits
     tests = [
         "bold karo",
         "font size 16 set karo",
-        "column ki width autofit karo",
-        "row height 30 karo",
         "text ko wrap karo",
         "merge karke center karo",
-        "Arial font lagao",
-        "borders sab taraf lagao",
-        "freeze the top row",
-        "A1 pe navigate karo",
-        "save karo",
-        "undo karo",
-        "percentage format karo",
-        "new row add karo",
         "bold aur center dono karo",
-        "header format karo 14 size mein",
     ]
 
-    print(f"\nProvider: {provider_config.provider} | Actions available: {len(REGISTRY)}\n" + "=" * 70)
+    print(f"\nProvider: {provider_config.provider} | Actions: {len(REGISTRY)}\n" + "=" * 60)
     for cmd in tests:
         result = client.send_command(cmd)
         print(f"\n'{cmd}'")
         print(f"  Plan:    {result['plan']}")
         print(f"  Actions: {result.get('action_ids', [])}")
-        print(f"  Steps:   {len(result['steps'])} steps")
-        print(f"  Confirm: {result['requires_confirmation']}")
+        print(f"  Steps:   {len(result['steps'])}")
+        _time.sleep(2)  # Respect RPM limits
