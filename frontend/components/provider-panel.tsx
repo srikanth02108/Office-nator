@@ -1,60 +1,79 @@
 "use client"
 
-import { useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import { motion, AnimatePresence } from "framer-motion"
-import { Zap, Eye, EyeOff, Check, ChevronDown, Plus } from "lucide-react"
+import { Zap, Eye, EyeOff, Check, ChevronDown, Plus, X } from "lucide-react"
 import { cn } from "@/lib/utils"
 import type { ProviderName, ProviderUsage } from "@/lib/useBackend"
 
-const PROVIDERS: { id: ProviderName; label: string; model: string; limit: string; color: string }[] = [
-  { id: "groq",   label: "Groq",   model: "Llama 3.3 70B",    limit: "14,400 req/day", color: "text-chart-4"  },
-  { id: "gemini", label: "Gemini", model: "2.5 Flash",         limit: "1,500 req/day",  color: "text-primary"  },
-  { id: "openai", label: "OpenAI", model: "GPT-4o-mini",       limit: "paid",           color: "text-chart-2"  },
-  { id: "custom", label: "Custom", model: "any OpenAI-compat", limit: "varies",         color: "text-chart-5"  },
+const PROVIDERS: {
+  id: ProviderName
+  label: string
+  model: string
+  limit: string
+  color: string
+}[] = [
+  { id: "groq",   label: "Groq",   model: "Llama 3.3 70B",    limit: "14,400 req/day", color: "text-chart-4" },
+  { id: "gemini", label: "Gemini", model: "2.5 Flash",         limit: "1,500 req/day",  color: "text-primary" },
+  { id: "openai", label: "OpenAI", model: "GPT-4o-mini",       limit: "paid",           color: "text-chart-2" },
+  { id: "custom", label: "Custom", model: "OpenAI-compatible", limit: "varies",         color: "text-chart-5" },
 ]
 
 type Props = {
-  provider:  ProviderName
-  keysSet:   Record<string, boolean>
-  usage:     Record<string, ProviderUsage>
+  provider:      ProviderName
+  keysSet:       Record<string, boolean>
+  usage:         Record<string, ProviderUsage>
   onSetProvider: (p: ProviderName) => void
   onSetKey:      (p: ProviderName, k: string) => void
   onSetCustom:   (url: string, model: string, key: string) => void
 }
 
-function UsageBar({ pct, color }: { pct: number; color: string }) {
-  const safe  = Math.min(100, Math.max(0, pct))
-  const clr   = safe > 80 ? "bg-destructive" : safe > 50 ? "bg-chart-4" : "bg-chart-2"
+// ── Usage bar ─────────────────────────────────────────────────────────────────
+function UsageBar({ pct }: { pct: number }) {
+  const safe = Math.min(100, Math.max(0, pct))
+  const color =
+    safe > 80 ? "bg-destructive" : safe > 50 ? "bg-chart-4" : "bg-chart-2"
   return (
-    <div className="mt-1 h-1 w-full rounded-full bg-secondary/50">
+    <div className="mt-1.5 h-1 w-full overflow-hidden rounded-full bg-secondary/60">
       <motion.div
-        className={cn("h-1 rounded-full", clr)}
+        className={cn("h-full rounded-full", color)}
         initial={{ width: 0 }}
         animate={{ width: `${safe}%` }}
-        transition={{ duration: 0.6, ease: "easeOut" }}
+        transition={{ duration: 0.5, ease: "easeOut" }}
       />
     </div>
   )
 }
 
+// ── API key input ─────────────────────────────────────────────────────────────
 function KeyInput({
-  provider, label, hasKey, onSave,
+  label,
+  hasKey,
+  onSave,
 }: {
-  provider: ProviderName
-  label: string
+  label:  string
   hasKey: boolean
   onSave: (k: string) => void
 }) {
   const [editing, setEditing] = useState(false)
   const [val, setVal]         = useState("")
   const [show, setShow]       = useState(false)
+  const inputRef              = useRef<HTMLInputElement>(null)
+
+  useEffect(() => {
+    if (editing) inputRef.current?.focus()
+  }, [editing])
+
+  const commit = () => {
+    if (val.trim()) { onSave(val.trim()); setEditing(false); setVal("") }
+  }
 
   if (!editing) {
     return (
       <button
-        onClick={() => setEditing(true)}
+        onClick={e => { e.stopPropagation(); setEditing(true) }}
         className={cn(
-          "flex items-center gap-1.5 rounded-md border px-2 py-1 font-mono text-[10px] uppercase tracking-widest transition-colors",
+          "flex shrink-0 items-center gap-1 rounded-md border px-2 py-1 font-mono text-[10px] uppercase tracking-widest transition-colors",
           hasKey
             ? "border-chart-2/30 bg-chart-2/10 text-chart-2"
             : "border-border bg-secondary/30 text-muted-foreground hover:border-primary/30 hover:text-foreground",
@@ -67,163 +86,239 @@ function KeyInput({
   }
 
   return (
-    <div className="flex items-center gap-1">
+    <div className="flex w-full items-center gap-1 pt-2" onClick={e => e.stopPropagation()}>
       <div className="relative flex-1">
         <input
-          autoFocus
+          ref={inputRef}
           type={show ? "text" : "password"}
           value={val}
           onChange={e => setVal(e.target.value)}
           onKeyDown={e => {
-            if (e.key === "Enter" && val.trim()) { onSave(val.trim()); setEditing(false); setVal("") }
+            if (e.key === "Enter")  commit()
             if (e.key === "Escape") { setEditing(false); setVal("") }
           }}
-          placeholder={`${label} API key…`}
-          className="w-full rounded-md border border-primary/40 bg-background/60 px-2 py-1 font-mono text-[10px] text-foreground outline-none placeholder:text-muted-foreground"
+          placeholder={`Paste ${label} API key…`}
+          className="w-full rounded-md border border-primary/40 bg-background/80 px-2 py-1.5 font-mono text-[10px] text-foreground outline-none placeholder:text-muted-foreground/60"
         />
         <button
+          type="button"
           onClick={() => setShow(s => !s)}
-          className="absolute right-1.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+          className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
         >
           {show ? <EyeOff className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
         </button>
       </div>
       <button
-        onClick={() => { if (val.trim()) { onSave(val.trim()); setEditing(false); setVal("") } }}
-        className="rounded-md bg-primary/20 px-2 py-1 font-mono text-[10px] text-primary hover:bg-primary/30"
+        onClick={commit}
+        className="shrink-0 rounded-md bg-primary/20 px-2 py-1.5 font-mono text-[10px] text-primary hover:bg-primary/30"
       >
         save
+      </button>
+      <button
+        onClick={() => { setEditing(false); setVal("") }}
+        className="shrink-0 text-muted-foreground hover:text-foreground"
+      >
+        <X className="h-3.5 w-3.5" />
       </button>
     </div>
   )
 }
 
-export function ProviderPanel({ provider, keysSet, usage, onSetProvider, onSetKey, onSetCustom }: Props) {
+// ── Main component ────────────────────────────────────────────────────────────
+export function ProviderPanel({
+  provider, keysSet, usage,
+  onSetProvider, onSetKey, onSetCustom,
+}: Props) {
   const [open,        setOpen]        = useState(false)
   const [customUrl,   setCustomUrl]   = useState("")
   const [customModel, setCustomModel] = useState("")
   const [customKey,   setCustomKey]   = useState("")
 
-  // Guard against undefined during initial render before WS state arrives
-  const safeKeysSet = keysSet  ?? { groq: false, gemini: false, openai: false, custom: false }
-  const safeUsage   = usage    ?? {}
+  const containerRef = useRef<HTMLDivElement>(null)
 
-  const active = PROVIDERS.find(p => p.id === provider) ?? PROVIDERS[0]
-  const activeUsage = safeUsage[provider] ?? { requests: 0, tokens_in: 0, tokens_out: 0, daily_request_limit: 0, usage_pct: 0 }
+  // Close when clicking outside
+  useEffect(() => {
+    if (!open) return
+    const handler = (e: MouseEvent) => {
+      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
+        setOpen(false)
+      }
+    }
+    document.addEventListener("mousedown", handler)
+    return () => document.removeEventListener("mousedown", handler)
+  }, [open])
+
+  // Close on Escape
+  useEffect(() => {
+    if (!open) return
+    const handler = (e: KeyboardEvent) => { if (e.key === "Escape") setOpen(false) }
+    document.addEventListener("keydown", handler)
+    return () => document.removeEventListener("keydown", handler)
+  }, [open])
+
+  const safeKeysSet = keysSet ?? { groq: false, gemini: false, openai: false, custom: false }
+  const safeUsage   = usage   ?? {}
+
+  const active      = PROVIDERS.find(p => p.id === provider) ?? PROVIDERS[0]
+  const activeUsage = safeUsage[provider] ?? {
+    requests: 0, tokens_in: 0, tokens_out: 0, daily_request_limit: 0, usage_pct: 0,
+  }
 
   return (
-    <div className="relative">
-      {/* Trigger button */}
+    // Positioned relative so the dropdown is anchored to this element only
+    <div ref={containerRef} className="relative">
+
+      {/* ── Trigger pill ─────────────────────────────────────────────── */}
       <button
         onClick={() => setOpen(o => !o)}
         className="flex items-center gap-2 rounded-full border border-border bg-card px-3 py-1.5 font-mono text-[10px] uppercase tracking-widest text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground"
       >
         <Zap className={cn("h-3 w-3", active.color)} />
         <span className={active.color}>{active.label}</span>
-        <span className="text-muted-foreground/60">·</span>
+        <span className="text-muted-foreground/50">·</span>
         <span>{activeUsage.usage_pct.toFixed(0)}%</span>
-        <ChevronDown className={cn("h-3 w-3 transition-transform", open && "rotate-180")} />
+        <ChevronDown className={cn("h-3 w-3 transition-transform duration-200", open && "rotate-180")} />
       </button>
 
-      {/* Dropdown panel */}
+      {/* ── Dropdown — fixed position to avoid layout shift / overlap ── */}
       <AnimatePresence>
         {open && (
-          <motion.div
-            initial={{ opacity: 0, y: -8, scale: 0.97 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            exit={{ opacity: 0, y: -8, scale: 0.97 }}
-            transition={{ duration: 0.15 }}
-            className="glass absolute right-0 top-10 z-50 w-80 rounded-2xl p-4 shadow-2xl"
-          >
-            <p className="mb-3 font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-              Brain Provider
-            </p>
+          <>
+            {/* Invisible backdrop — catches outside clicks on mobile too */}
+            <div
+              className="fixed inset-0 z-40"
+              onClick={() => setOpen(false)}
+            />
 
-            <div className="space-y-2">
-              {PROVIDERS.map(p => {
-                const u    = safeUsage[p.id]   ?? { requests: 0, usage_pct: 0, daily_request_limit: 0, tokens_in: 0, tokens_out: 0 }
-                const isActive = p.id === provider
+            <motion.div
+              initial={{ opacity: 0, y: -6, scale: 0.98 }}
+              animate={{ opacity: 1, y: 0,  scale: 1    }}
+              exit={{    opacity: 0, y: -6, scale: 0.98 }}
+              transition={{ duration: 0.15, ease: "easeOut" }}
+              // fixed position so it never disturbs the page layout
+              className={cn(
+                "fixed z-50 w-[22rem] rounded-2xl p-4 shadow-2xl",
+                "glass border border-border",
+                // position below the trigger — top bar is ~65px tall
+                "top-[68px] right-4",
+              )}
+              style={{ maxHeight: "calc(100vh - 88px)", overflowY: "auto" }}
+            >
+              {/* Header row */}
+              <div className="mb-3 flex items-center justify-between">
+                <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+                  Brain Provider
+                </p>
+                <button
+                  onClick={() => setOpen(false)}
+                  className="text-muted-foreground hover:text-foreground"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              </div>
 
-                return (
-                  <div
-                    key={p.id}
-                    className={cn(
-                      "rounded-xl border p-3 transition-colors",
-                      isActive
-                        ? "border-primary/40 bg-primary/5"
-                        : "border-border bg-secondary/20 hover:border-border/80",
-                    )}
-                  >
-                    {/* Provider row */}
-                    <div className="flex items-center justify-between">
-                      <button
-                        onClick={() => { onSetProvider(p.id); }}
-                        className="flex items-center gap-2"
-                      >
-                        <span className={cn(
-                          "h-2 w-2 rounded-full border-2",
-                          isActive ? "border-primary bg-primary" : "border-muted-foreground",
-                        )} />
-                        <span className={cn("text-sm font-medium", p.color)}>{p.label}</span>
-                        <span className="font-mono text-[10px] text-muted-foreground">{p.model}</span>
-                      </button>
+              {/* Provider cards */}
+              <div className="space-y-2">
+                {PROVIDERS.map(p => {
+                  const u = safeUsage[p.id] ?? {
+                    requests: 0, usage_pct: 0, daily_request_limit: 0,
+                    tokens_in: 0, tokens_out: 0,
+                  }
+                  const isActive  = p.id === provider
+                  const hasKey    = safeKeysSet[p.id] ?? false
 
-                      <KeyInput
-                        provider={p.id}
-                        label={p.label}
-                        hasKey={safeKeysSet[p.id] ?? false}
-                        onSave={key => onSetKey(p.id, key)}
-                      />
-                    </div>
-
-                    {/* Usage bar (only if has key) */}
-                    {(safeKeysSet[p.id] || isActive) && (
-                      <div className="mt-2">
-                        <div className="flex items-center justify-between font-mono text-[9px] text-muted-foreground">
-                          <span>{u.requests} req today</span>
-                          <span>{u.usage_pct.toFixed(1)}% of {p.limit}</span>
-                        </div>
-                        <UsageBar pct={u.usage_pct} color={p.color} />
-                        {u.tokens_in + u.tokens_out > 0 && (
-                          <p className="mt-0.5 font-mono text-[9px] text-muted-foreground">
-                            {(u.tokens_in + u.tokens_out).toLocaleString()} tokens total
-                          </p>
-                        )}
-                      </div>
-                    )}
-
-                    {/* Custom provider extra fields */}
-                    {p.id === "custom" && isActive && (
-                      <div className="mt-3 space-y-2 border-t border-border pt-3">
-                        <input
-                          value={customUrl}
-                          onChange={e => setCustomUrl(e.target.value)}
-                          placeholder="Base URL (e.g. http://localhost:11434/v1)"
-                          className="w-full rounded-md border border-border bg-background/60 px-2 py-1 font-mono text-[10px] text-foreground outline-none placeholder:text-muted-foreground"
-                        />
-                        <input
-                          value={customModel}
-                          onChange={e => setCustomModel(e.target.value)}
-                          placeholder="Model name (e.g. llama3.2)"
-                          className="w-full rounded-md border border-border bg-background/60 px-2 py-1 font-mono text-[10px] text-foreground outline-none placeholder:text-muted-foreground"
-                        />
+                  return (
+                    <div
+                      key={p.id}
+                      className={cn(
+                        "rounded-xl border p-3 transition-colors",
+                        isActive
+                          ? "border-primary/40 bg-primary/5"
+                          : "border-border bg-secondary/20",
+                      )}
+                    >
+                      {/* Top row — radio + labels + key button */}
+                      <div className="flex items-center justify-between gap-2">
                         <button
-                          onClick={() => { if (customUrl && customModel) { onSetCustom(customUrl, customModel, customKey) } }}
-                          className="w-full rounded-md bg-primary/20 py-1 font-mono text-[10px] text-primary hover:bg-primary/30"
+                          onClick={() => onSetProvider(p.id)}
+                          className="flex min-w-0 items-center gap-2"
                         >
-                          apply custom provider
+                          {/* radio dot */}
+                          <span className={cn(
+                            "h-2 w-2 shrink-0 rounded-full border-2 transition-colors",
+                            isActive
+                              ? "border-primary bg-primary"
+                              : "border-muted-foreground bg-transparent",
+                          )} />
+                          <span className={cn("text-sm font-semibold", p.color)}>
+                            {p.label}
+                          </span>
+                          <span className="truncate font-mono text-[9px] text-muted-foreground">
+                            {p.model}
+                          </span>
                         </button>
-                      </div>
-                    )}
-                  </div>
-                )
-              })}
-            </div>
 
-            <p className="mt-3 font-mono text-[9px] text-muted-foreground/60">
-              Keys saved in memory only — not persisted to disk.
-            </p>
-          </motion.div>
+                        <KeyInput
+                          label={p.label}
+                          hasKey={hasKey}
+                          onSave={key => onSetKey(p.id, key)}
+                        />
+                      </div>
+
+                      {/* Usage bar — always shown for active, shown for others if key is set */}
+                      {(isActive || hasKey) && (
+                        <div className="mt-2">
+                          <div className="flex items-center justify-between font-mono text-[9px] text-muted-foreground">
+                            <span>{u.requests} req today</span>
+                            <span>
+                              {u.usage_pct.toFixed(1)}% · {p.limit}
+                            </span>
+                          </div>
+                          <UsageBar pct={u.usage_pct} />
+                          {(u.tokens_in + u.tokens_out) > 0 && (
+                            <p className="mt-0.5 font-mono text-[9px] text-muted-foreground">
+                              {(u.tokens_in + u.tokens_out).toLocaleString()} tokens
+                            </p>
+                          )}
+                        </div>
+                      )}
+
+                      {/* Custom provider fields — only when custom is active */}
+                      {p.id === "custom" && isActive && (
+                        <div className="mt-3 space-y-2 border-t border-border pt-3">
+                          <input
+                            value={customUrl}
+                            onChange={e => setCustomUrl(e.target.value)}
+                            placeholder="Base URL  e.g. http://localhost:11434/v1"
+                            className="w-full rounded-md border border-border bg-background/60 px-2 py-1.5 font-mono text-[10px] text-foreground outline-none placeholder:text-muted-foreground/60"
+                          />
+                          <input
+                            value={customModel}
+                            onChange={e => setCustomModel(e.target.value)}
+                            placeholder="Model name  e.g. llama3.2"
+                            className="w-full rounded-md border border-border bg-background/60 px-2 py-1.5 font-mono text-[10px] text-foreground outline-none placeholder:text-muted-foreground/60"
+                          />
+                          <button
+                            onClick={() => {
+                              if (customUrl && customModel)
+                                onSetCustom(customUrl, customModel, customKey)
+                            }}
+                            className="w-full rounded-md bg-primary/20 py-1.5 font-mono text-[10px] text-primary hover:bg-primary/30"
+                          >
+                            apply custom provider
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  )
+                })}
+              </div>
+
+              <p className="mt-3 font-mono text-[9px] text-muted-foreground/50">
+                Keys stored in memory only — cleared on server restart.
+              </p>
+            </motion.div>
+          </>
         )}
       </AnimatePresence>
     </div>
