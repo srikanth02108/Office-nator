@@ -2,16 +2,14 @@
 """
 Sutra FastAPI Bridge Server
 ============================
-Exposes the backend pipeline over:
-  - WebSocket  ws://localhost:8000/ws      — real-time state events → frontend
-  - POST       http://localhost:8000/start  — trigger a listen cycle
-  - POST       http://localhost:8000/stop   — abort current cycle
-  - POST       http://localhost:8000/undo   — send Ctrl+Z
-  - GET        http://localhost:8000/status — current agent state (polling fallback)
-
-Run with:
-    python server.py
-    (keep main.py for CLI-only use; this is the GUI-connected entrypoint)
+  ws://localhost:8000/ws          — real-time state events
+  POST /start                     — begin listen cycle
+  POST /stop                      — abort current cycle
+  POST /undo                      — Ctrl+Z immediately
+  GET  /status                    — full state snapshot
+  GET  /config                    — current provider + key status
+  POST /config                    — switch provider / set API keys
+  GET  /usage                     — token/request usage per provider
 """
 
 import asyncio
@@ -28,19 +26,18 @@ import pyautogui
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-# ── project root on path ──────────────────────────────────────────────────────
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJECT_ROOT)
 
 from ears.vad_listener import VoiceListener
 from ears.sarvam_stt import SarvamSTT
-from brain.n8n_client import N8NClient
+from brain.n8n_client import N8NClient, provider_config, usage
 from hands.actuator import Actuator
 from voice.tts_speaker import TTSSpeaker
 from memory.mem0_manager import MemoryManager
 
-# ── logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s │ %(name)-20s │ %(levelname)-7s │ %(message)s",
@@ -50,35 +47,45 @@ logger = logging.getLogger("sutra.server")
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
-# ── FastAPI app ───────────────────────────────────────────────────────────────
-app = FastAPI(title="Sutra Backend", version="1.0.0")
+app = FastAPI(title="Sutra Backend", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=["*"],   # allow any origin (Vercel preview URLs, ngrok, localhost)
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# ── Pydantic models for /config POST ─────────────────────────────────────────
+class ConfigUpdate(BaseModel):
+    provider:      Optional[str] = None   # "groq" | "gemini" | "openai" | "custom"
+    groq_key:      Optional[str] = None
+    gemini_key:    Optional[str] = None
+    openai_key:    Optional[str] = None
+    custom_url:    Optional[str] = None
+    custom_model:  Optional[str] = None
+    custom_key:    Optional[str] = None
+
 # ── global shared state ───────────────────────────────────────────────────────
 class AgentState:
     def __init__(self):
-        self.status: str = "idle"          # idle | listening | processing | executing
+        self.status: str = "idle"
         self.command_count: int = 0
         self.last_hindi: str = ""
         self.last_english: str = ""
         self.last_plan: str = ""
         self.last_steps: list = []
         self.memories: list = []
-        self.transcript: list = []         # list of {id, hindi, english, time, plan, steps}
+        self.transcript: list = []
         self._abort: bool = False
         self._lock = threading.Lock()
 
     def set_status(self, s: str):
         with self._lock:
             self.status = s
-        asyncio.run_coroutine_threadsafe(broadcast_state(), loop)
+        if loop and not loop.is_closed():
+            asyncio.run_coroutine_threadsafe(broadcast_state(), loop)
 
     def abort(self):
         with self._lock:
@@ -94,6 +101,8 @@ class AgentState:
 
     def to_dict(self) -> dict:
         with self._lock:
+            cfg = provider_config.get()
+            usage_stats = usage.get_all_stats()
             return {
                 "type": "state",
                 "status": self.status,
@@ -103,7 +112,10 @@ class AgentState:
                 "last_plan": self.last_plan,
                 "last_steps": self.last_steps,
                 "memories": self.memories,
-                "transcript": self.transcript[-50:],  # last 50 entries
+                "transcript": self.transcript[-50:],
+                "provider": cfg["provider"],
+                "keys_set": cfg["keys_set"],
+                "usage": usage_stats,
             }
 
 
@@ -111,19 +123,17 @@ state = AgentState()
 loop: asyncio.AbstractEventLoop = None
 connected_clients: list[WebSocket] = []
 
-# ── component singletons (initialized on startup) ─────────────────────────────
-listener: Optional[VoiceListener] = None
-stt: Optional[SarvamSTT] = None
-brain: Optional[N8NClient] = None
-actuator: Optional[Actuator] = None
-speaker: Optional[TTSSpeaker] = None
-memory: Optional[MemoryManager] = None
+listener:     Optional[VoiceListener] = None
+stt:          Optional[SarvamSTT]     = None
+brain:        Optional[N8NClient]     = None
+actuator:     Optional[Actuator]      = None
+speaker:      Optional[TTSSpeaker]    = None
+memory:       Optional[MemoryManager] = None
 agent_thread: Optional[threading.Thread] = None
 
 
-# ── WebSocket broadcast ───────────────────────────────────────────────────────
+# ── broadcast helpers ─────────────────────────────────────────────────────────
 async def broadcast_state():
-    """Push current state to all connected WebSocket clients."""
     if not connected_clients:
         return
     msg = json.dumps(state.to_dict())
@@ -134,11 +144,11 @@ async def broadcast_state():
         except Exception:
             dead.append(ws)
     for ws in dead:
-        connected_clients.remove(ws)
+        if ws in connected_clients:
+            connected_clients.remove(ws)
 
 
 async def broadcast_event(event: dict):
-    """Push a one-off event to all connected WebSocket clients."""
     if not connected_clients:
         return
     msg = json.dumps(event)
@@ -149,86 +159,67 @@ async def broadcast_event(event: dict):
         except Exception:
             dead.append(ws)
     for ws in dead:
-        connected_clients.remove(ws)
+        if ws in connected_clients:
+            connected_clients.remove(ws)
 
 
 def emit(event: dict):
-    """Thread-safe wrapper to broadcast from a worker thread."""
     if loop and not loop.is_closed():
         asyncio.run_coroutine_threadsafe(broadcast_event(event), loop)
 
 
-# ── agent worker (runs in a background thread) ────────────────────────────────
+# ── agent pipeline ────────────────────────────────────────────────────────────
 def run_listen_cycle():
-    """
-    One full pipeline cycle:
-      listen → translate → plan → (confirm?) → execute → report
-    Called in a daemon thread so FastAPI stays responsive.
-    """
     global agent_thread
 
     if state.status != "idle":
-        logger.info("Cycle already running, skipping.")
         return
 
     state.clear_abort()
 
     try:
-        # ── Step 1: Listen ─────────────────────────────────────────────────
+        # Step 1 — Listen
         state.set_status("listening")
         emit({"type": "status", "status": "listening"})
-        logger.info("Waiting for speech...")
 
         try:
             audio = listener.record_until_silence()
         except Exception as e:
-            logger.error("Recording failed: %s", e)
             emit({"type": "error", "message": f"Recording failed: {e}"})
             state.set_status("idle")
             return
 
-        if state.should_abort():
+        if state.should_abort() or not audio or len(audio) < 1000:
             state.set_status("idle")
             return
 
-        if not audio or len(audio) < 1000:
-            emit({"type": "error", "message": "No audio captured"})
-            state.set_status("idle")
-            return
-
-        # ── Step 2: Translate ──────────────────────────────────────────────
+        # Step 2 — Translate
         state.set_status("processing")
         emit({"type": "status", "status": "processing"})
-        logger.info("Translating...")
 
         english_text = stt.transcribe_and_translate(audio)
         if not english_text or not english_text.strip():
-            emit({"type": "error", "message": "Empty transcription"})
-            speaker.speak("I didn't catch anything. Please try again.")
+            emit({"type": "error", "message": "Couldn't hear anything clearly"})
+            speaker.speak("I didn't catch that. Please try again.")
             state.set_status("idle")
             return
 
-        # We don't have the raw Hindi text from Sarvam (it translates directly)
-        # so we display the english text in both fields for the transcript
         with state._lock:
             state.last_english = english_text
-            state.last_hindi = english_text  # Sarvam translate mode returns English directly
+            state.last_hindi = english_text
 
         emit({"type": "transcript_partial", "english": english_text})
-        logger.info("Heard: %s", english_text)
 
         if state.should_abort():
             state.set_status("idle")
             return
 
-        # ── Step 3: Memory ─────────────────────────────────────────────────
+        # Step 3 — Memory context
         context = memory.get_context(english_text)
-        memories = memory.get_all_memories()
         with state._lock:
-            state.memories = memories
+            state.memories = memory.get_all_memories()
 
-        # ── Step 4: Plan ───────────────────────────────────────────────────
-        logger.info("Planning...")
+        # Step 4 — Plan
         plan = brain.send_command(english_text, context)
         plan_text = plan.get("plan", "")
         steps = plan.get("steps", [])
@@ -238,12 +229,15 @@ def run_listen_cycle():
             state.last_plan = plan_text
             state.last_steps = steps
 
-        emit({"type": "plan", "plan": plan_text, "steps": steps, "requires_confirmation": requires_confirmation})
-        logger.info("Plan: %s (%d steps)", plan_text, len(steps))
+        # Broadcast updated usage after LLM call
+        emit({"type": "plan", "plan": plan_text, "steps": steps,
+              "requires_confirmation": requires_confirmation,
+              "usage": usage.get_all_stats(),
+              "provider": provider_config.provider})
 
         if not steps:
-            emit({"type": "error", "message": f"No actions for: {english_text}"})
-            speaker.speak(f"I understood, but I don't know how to do that yet.")
+            emit({"type": "error", "message": f"No actions found for: {english_text}"})
+            speaker.speak("I understood, but I don't have steps for that.")
             state.set_status("idle")
             return
 
@@ -251,35 +245,32 @@ def run_listen_cycle():
             state.set_status("idle")
             return
 
-        # ── Step 5: Confirmation (destructive actions) ────────────────────
+        # Step 5 — Confirmation for destructive actions
         if requires_confirmation:
             emit({"type": "confirm_required", "plan": plan_text})
             speaker.speak(f"I'm about to {plan_text}. Say yes or no.")
-
-            # Listen for yes/no
             try:
                 confirm_audio = listener.record_until_silence()
                 confirm_text = stt.transcribe_and_translate(confirm_audio).lower()
-                affirmative = ["yes", "yeah", "ok", "sure", "haan", "ha", "proceed", "do it"]
+                affirmative = ["yes","yeah","ok","sure","haan","ha","proceed","do it","karo","kar do"]
                 confirmed = any(w in confirm_text for w in affirmative)
             except Exception:
                 confirmed = False
 
             if not confirmed:
-                emit({"type": "aborted", "reason": "User did not confirm"})
+                emit({"type": "aborted", "reason": "User cancelled"})
                 speaker.speak("Okay, cancelled.")
                 state.set_status("idle")
                 return
 
-        # ── Step 6: Execute ────────────────────────────────────────────────
+        # Step 6 — Execute
         state.set_status("executing")
         emit({"type": "status", "status": "executing"})
-        logger.info("Executing %d steps...", len(steps))
 
         try:
             success = actuator.execute_plan(steps)
         except pyautogui.FailSafeException:
-            emit({"type": "error", "message": "Failsafe triggered! Move mouse away from corner."})
+            emit({"type": "error", "message": "Failsafe triggered — mouse moved to corner"})
             state.set_status("idle")
             return
         except Exception as e:
@@ -287,7 +278,7 @@ def run_listen_cycle():
             state.set_status("idle")
             return
 
-        # ── Step 7: Report ─────────────────────────────────────────────────
+        # Step 7 — Report + learn
         with state._lock:
             state.command_count += 1
             entry = {
@@ -306,29 +297,26 @@ def run_listen_cycle():
         if success:
             speaker.speak("Done!")
             emit({"type": "done", "plan": plan_text})
-            # Learn from this interaction — extract preferences in background
             threading.Thread(
                 target=lambda: memory.save_from_conversation(english_text, plan_text),
                 daemon=True,
             ).start()
-            # Update memories in state for frontend
             with state._lock:
                 state.memories = memory.get_all_memories()
-            asyncio.run_coroutine_threadsafe(broadcast_state(), loop)
+            if loop and not loop.is_closed():
+                asyncio.run_coroutine_threadsafe(broadcast_state(), loop)
         else:
             speaker.speak("Some steps failed.")
             emit({"type": "error", "message": "Some steps failed"})
 
     except Exception as e:
-        logger.exception("Unexpected error in cycle: %s", e)
+        logger.exception("Pipeline error: %s", e)
         emit({"type": "error", "message": str(e)})
-
     finally:
         state.set_status("idle")
-        emit({"type": "status", "status": "idle"})
 
 
-# ── REST endpoints ─────────────────────────────────────────────────────────────
+# ── REST endpoints ────────────────────────────────────────────────────────────
 @app.get("/status")
 def get_status():
     return state.to_dict()
@@ -336,28 +324,25 @@ def get_status():
 
 @app.post("/start")
 def start_listening():
-    """Trigger one listen cycle (equivalent to pressing Ctrl+Space)."""
     global agent_thread
     if state.status != "idle":
         return {"ok": False, "message": "Already running"}
-
     agent_thread = threading.Thread(target=run_listen_cycle, daemon=True)
     agent_thread.start()
-    return {"ok": True, "message": "Listening started"}
+    return {"ok": True}
 
 
 @app.post("/stop")
 def stop_listening():
-    """Abort the current cycle."""
     state.abort()
-    speaker.stop()
+    if speaker:
+        speaker.stop()
     state.set_status("idle")
-    return {"ok": True, "message": "Stopped"}
+    return {"ok": True}
 
 
 @app.post("/undo")
 def undo_last():
-    """Send Ctrl+Z immediately."""
     try:
         actuator.execute_plan([{"action": "hotkey", "keys": ["ctrl", "z"]}])
         emit({"type": "undo", "message": "Undo executed (Ctrl+Z)"})
@@ -366,21 +351,78 @@ def undo_last():
         return {"ok": False, "message": str(e)}
 
 
-# ── WebSocket endpoint ────────────────────────────────────────────────────────
+@app.get("/config")
+def get_config():
+    cfg = provider_config.get()
+    return {
+        "provider": cfg["provider"],
+        "keys_set": cfg["keys_set"],
+        "custom_url": cfg["custom_url"],
+        "custom_model": cfg["custom_model"],
+        "available_providers": ["groq", "gemini", "openai", "custom"],
+    }
+
+
+@app.post("/config")
+def update_config(body: ConfigUpdate):
+    """Switch provider and/or update API keys at runtime — no restart needed."""
+    changed = []
+
+    if body.provider:
+        provider_config.set_provider(body.provider)
+        changed.append(f"provider={body.provider}")
+
+    if body.groq_key is not None:
+        provider_config.set_key("groq", body.groq_key)
+        changed.append("groq_key")
+
+    if body.gemini_key is not None:
+        provider_config.set_key("gemini", body.gemini_key)
+        changed.append("gemini_key")
+
+    if body.openai_key is not None:
+        provider_config.set_key("openai", body.openai_key)
+        changed.append("openai_key")
+
+    if body.custom_url or body.custom_model:
+        provider_config.set_custom(
+            url=body.custom_url or provider_config.custom_url,
+            model=body.custom_model or provider_config.custom_model,
+            key=body.custom_key or provider_config.keys.get("custom", ""),
+        )
+        changed.append("custom")
+
+    # Broadcast updated config to all connected frontends
+    emit({"type": "config_changed",
+          "provider": provider_config.provider,
+          "keys_set": provider_config.get()["keys_set"]})
+
+    return {"ok": True, "changed": changed, "config": provider_config.get()}
+
+
+@app.get("/usage")
+def get_usage():
+    return usage.get_all_stats()
+
+
+# ── WebSocket ─────────────────────────────────────────────────────────────────
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     connected_clients.append(ws)
-    logger.info("Frontend connected. Total clients: %d", len(connected_clients))
+    logger.info("Frontend connected (%d total)", len(connected_clients))
 
-    # Send current state immediately on connect
+    # Full state on connect
     await ws.send_text(json.dumps(state.to_dict()))
 
     try:
         while True:
-            # Keep connection alive; frontend can also send commands over WS
             data = await ws.receive_text()
-            msg = json.loads(data)
+            try:
+                msg = json.loads(data)
+            except Exception:
+                continue
+
             cmd = msg.get("command")
 
             if cmd == "start":
@@ -388,10 +430,13 @@ async def websocket_endpoint(ws: WebSocket):
                 if state.status == "idle":
                     agent_thread = threading.Thread(target=run_listen_cycle, daemon=True)
                     agent_thread.start()
+
             elif cmd == "stop":
                 state.abort()
-                speaker.stop()
+                if speaker:
+                    speaker.stop()
                 state.set_status("idle")
+
             elif cmd == "undo":
                 threading.Thread(
                     target=lambda: actuator.execute_plan([{"action": "hotkey", "keys": ["ctrl", "z"]}]),
@@ -399,13 +444,39 @@ async def websocket_endpoint(ws: WebSocket):
                 ).start()
                 emit({"type": "undo", "message": "Undo executed"})
 
+            elif cmd == "set_provider":
+                provider_config.set_provider(msg.get("provider", "groq"))
+                emit({"type": "config_changed",
+                      "provider": provider_config.provider,
+                      "keys_set": provider_config.get()["keys_set"]})
+
+            elif cmd == "set_key":
+                provider_config.set_key(msg.get("provider", ""), msg.get("key", ""))
+                emit({"type": "config_changed",
+                      "provider": provider_config.provider,
+                      "keys_set": provider_config.get()["keys_set"]})
+
+            elif cmd == "set_custom":
+                provider_config.set_custom(
+                    msg.get("url", ""),
+                    msg.get("model", ""),
+                    msg.get("key", ""),
+                )
+                emit({"type": "config_changed",
+                      "provider": provider_config.provider,
+                      "keys_set": provider_config.get()["keys_set"]})
+
+            elif cmd == "get_usage":
+                await ws.send_text(json.dumps({"type": "usage", "data": usage.get_all_stats()}))
+
     except WebSocketDisconnect:
-        connected_clients.remove(ws)
-        logger.info("Frontend disconnected. Total clients: %d", len(connected_clients))
+        pass
     except Exception as e:
         logger.error("WebSocket error: %s", e)
+    finally:
         if ws in connected_clients:
             connected_clients.remove(ws)
+        logger.info("Frontend disconnected (%d total)", len(connected_clients))
 
 
 # ── startup / shutdown ────────────────────────────────────────────────────────
@@ -418,46 +489,35 @@ async def startup():
 
     try:
         listener = VoiceListener()
-        logger.info("✅ VoiceListener ready")
+        logger.info("✅ VoiceListener (Silero VAD)")
     except Exception as e:
-        logger.error("❌ VoiceListener failed: %s", e)
+        logger.error("❌ VoiceListener: %s", e)
 
     stt = SarvamSTT()
-    logger.info("✅ SarvamSTT ready")
+    logger.info("✅ SarvamSTT")
 
     brain = N8NClient()
-    logger.info("✅ N8NClient ready")
+    logger.info("✅ Brain (%s)", provider_config.provider)
 
     actuator = Actuator()
-    logger.info("✅ Actuator ready")
+    logger.info("✅ Actuator")
 
     speaker = TTSSpeaker()
-    logger.info("✅ TTSSpeaker ready")
+    logger.info("✅ TTSSpeaker")
 
     memory = MemoryManager()
-    logger.info("✅ MemoryManager ready (%d memories)", memory.memory_count())
-
-    # Populate initial memory state for frontend
     state.memories = memory.get_all_memories()
+    logger.info("✅ Memory (%d facts)", memory.memory_count())
 
-    logger.info("🚀 Sutra server ready at http://localhost:8000")
-    logger.info("   WebSocket: ws://localhost:8000/ws")
-    logger.info("   Press Ctrl+C to stop")
+    logger.info("🚀 Ready — http://localhost:8000  |  ws://localhost:8000/ws")
 
 
 @app.on_event("shutdown")
 async def shutdown():
     if listener:
         listener.cleanup()
-    logger.info("Sutra server stopped.")
+    logger.info("Sutra stopped.")
 
 
-# ── entrypoint ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    uvicorn.run(
-        "server:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=False,
-        log_level="warning",
-    )
+    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=False, log_level="warning")

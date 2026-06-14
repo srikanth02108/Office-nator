@@ -1,9 +1,12 @@
-"""Brain module — multi-provider LLM planner with rich Excel action vocabulary.
+"""Brain module — multi-provider LLM planner with full Excel ribbon coverage.
 
-Provider priority (set LLM_PROVIDER in .env):
-  1. groq   — Llama 3.3 70B via Groq Cloud (free, very fast, recommended)
-  2. gemini — Gemini 2.5 Flash (free tier, slower)
-  3. n8n    — n8n webhook fallback
+Provider cascade (runtime-switchable via /config endpoint):
+  groq    → Llama 3.3 70B  (free 14,400 req/day, ~1s latency)
+  gemini  → Gemini 2.5 Flash (free tier)
+  openai  → GPT-4o-mini (paid, most capable)
+  custom  → Any OpenAI-compatible endpoint (Ollama, Together, Mistral, etc.)
+
+Usage tracking: per-session token counts broadcast to frontend.
 """
 
 import json
@@ -11,312 +14,384 @@ import logging
 import re
 import sys
 import os
-from datetime import datetime
+import threading
+from datetime import datetime, date
 from typing import Optional
 
 import requests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import GEMINI_API_KEY, GROQ_API_KEY, LLM_PROVIDER, N8N_WEBHOOK_URL, N8N_TIMEOUT
+from config import GEMINI_API_KEY, GROQ_API_KEY, OPENAI_API_KEY, LLM_PROVIDER, N8N_WEBHOOK_URL, N8N_TIMEOUT
 
 logger = logging.getLogger(__name__)
 
-# ─── Model endpoints ─────────────────────────────────────────────────────────
+# ─── Provider endpoints ──────────────────────────────────────────────────────
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
 GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "llama-3.3-70b-versatile"
+OPENAI_URL = "https://api.openai.com/v1/chat/completions"
+
+# Free tier daily limits (approximate)
+PROVIDER_LIMITS = {
+    "groq":   {"daily_requests": 14400, "daily_tokens": 500000,  "rpm": 30},
+    "gemini": {"daily_requests": 1500,  "daily_tokens": 1000000, "rpm": 15},
+    "openai": {"daily_requests": 999999,"daily_tokens": 999999,  "rpm": 500},
+    "custom": {"daily_requests": 999999,"daily_tokens": 999999,  "rpm": 999},
+}
+
+# ─── Usage tracker ────────────────────────────────────────────────────────────
+class UsageTracker:
+    """Tracks token and request usage per provider per day."""
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._data: dict = {}   # {provider: {date: {requests, tokens_in, tokens_out}}}
+
+    def _today(self) -> str:
+        return date.today().isoformat()
+
+    def record(self, provider: str, tokens_in: int, tokens_out: int):
+        with self._lock:
+            today = self._today()
+            if provider not in self._data:
+                self._data[provider] = {}
+            if today not in self._data[provider]:
+                self._data[provider][today] = {"requests": 0, "tokens_in": 0, "tokens_out": 0}
+            self._data[provider][today]["requests"] += 1
+            self._data[provider][today]["tokens_in"] += tokens_in
+            self._data[provider][today]["tokens_out"] += tokens_out
+
+    def get_today(self, provider: str) -> dict:
+        with self._lock:
+            today = self._today()
+            base = {"requests": 0, "tokens_in": 0, "tokens_out": 0}
+            return self._data.get(provider, {}).get(today, base).copy()
+
+    def get_usage_pct(self, provider: str) -> float:
+        """Return usage as 0-100 percentage of daily request limit."""
+        today = self.get_today(provider)
+        limit = PROVIDER_LIMITS.get(provider, {}).get("daily_requests", 1)
+        return min(100.0, round(today["requests"] / limit * 100, 1))
+
+    def get_all_stats(self) -> dict:
+        result = {}
+        for provider in ["groq", "gemini", "openai", "custom"]:
+            today = self.get_today(provider)
+            limits = PROVIDER_LIMITS.get(provider, {})
+            result[provider] = {
+                **today,
+                "daily_request_limit": limits.get("daily_requests", 0),
+                "usage_pct": self.get_usage_pct(provider),
+            }
+        return result
+
+usage = UsageTracker()
+
+# ─── Runtime config (switchable without restart) ─────────────────────────────
+class ProviderConfig:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.provider: str = LLM_PROVIDER
+        self.keys: dict = {
+            "groq":   GROQ_API_KEY,
+            "gemini": GEMINI_API_KEY,
+            "openai": OPENAI_API_KEY,
+            "custom": "",
+        }
+        self.custom_url:   str = ""
+        self.custom_model: str = ""
+
+    def set_provider(self, provider: str):
+        with self._lock:
+            self.provider = provider.lower()
+        logger.info("Provider switched to: %s", self.provider)
+
+    def set_key(self, provider: str, key: str):
+        with self._lock:
+            self.keys[provider.lower()] = key
+        logger.info("API key updated for provider: %s", provider)
+
+    def set_custom(self, url: str, model: str, key: str = ""):
+        with self._lock:
+            self.custom_url = url
+            self.custom_model = model
+            self.keys["custom"] = key
+        logger.info("Custom provider set: %s / %s", url, model)
+
+    def get(self) -> dict:
+        with self._lock:
+            return {
+                "provider": self.provider,
+                "custom_url": self.custom_url,
+                "custom_model": self.custom_model,
+                "keys_set": {k: bool(v) for k, v in self.keys.items()},
+            }
+
+provider_config = ProviderConfig()
 
 # ─── System prompt ────────────────────────────────────────────────────────────
-# This is the core "intelligence" of Sutra. It teaches the model exactly
-# how every Excel operation maps to keyboard actions.
-SYSTEM_PROMPT = """You are Sutra, an AI agent that controls Microsoft Excel on Windows
-via keyboard shortcuts and UI automation. The user speaks in Hindi/Marathi and their
-speech is translated to English before reaching you.
+SYSTEM_PROMPT = """You are Sutra, a precision AI agent that controls Microsoft Excel on Windows
+using keyboard shortcuts. User speech is translated from Hindi/Marathi to English.
 
-Your job: convert the user's natural language command into a precise sequence of
-keyboard actions. Think step-by-step before deciding the steps.
+CRITICAL OUTPUT RULE: Return ONLY a JSON object. No markdown. No explanation. No code fences.
 
-═══════════════════════════════════════════════════════════
-OUTPUT FORMAT — return ONLY this JSON, no markdown, no extra text:
+JSON FORMAT:
 {
-  "plan": "Plain English description of what you will do",
-  "requires_confirmation": false,
-  "steps": [
-    {"action": "hotkey",    "keys": ["ctrl", "b"]},
-    {"action": "type_text", "text": "hello"},
-    {"action": "wait",      "seconds": 0.5},
-    {"action": "press_key", "keys": ["enter"]}
-  ]
-}
-═══════════════════════════════════════════════════════════
-
-ACTION TYPES:
-- hotkey:    press keyboard shortcut  → {"action": "hotkey", "keys": ["ctrl", "b"]}
-- press_key: press a single key       → {"action": "press_key", "keys": ["enter"]}
-- type_text: type literal text        → {"action": "type_text", "text": "Revenue"}
-- wait:      pause N seconds          → {"action": "wait", "seconds": 0.4}
-
-═══════════════════════════════════════════════════════════
-COMPLETE EXCEL KEYBOARD REFERENCE
-═══════════════════════════════════════════════════════════
-
-── BASIC FORMATTING ──
-Bold:                  Ctrl+B
-Italic:                Ctrl+I
-Underline:             Ctrl+U
-Strikethrough:         Ctrl+5
-Clear formatting:      Alt+H then E then F (press separately with waits)
-
-── FONT SIZE ──
-To change font size to e.g. 14:
-  Step 1: Alt+H        (go to Home tab)
-  Step 2: wait 0.3s
-  Step 3: F+S          (hotkey: ["alt","h"] then type "fs" — opens font size box)
-  BETTER approach — use Name Box / Format Cells:
-  Step 1: hotkey Ctrl+1            (open Format Cells dialog)
-  Step 2: wait 0.5s
-  Step 3: hotkey Alt+Z             (jump to Font Size field in dialog)
-  — OR — use keyboard navigation:
-  Step 1: hotkey ["alt","h"]       (Home tab)
-  Step 2: wait 0.3s
-  Step 3: type_text "fs"           (Font Size box shortcut key)
-  Step 4: wait 0.3s
-  Step 5: press_key ["ctrl","a"]   (select all in font size box)
-  Step 6: type_text "14"           (type the size)
-  Step 7: press_key ["enter"]
-
-  SIMPLEST — ribbon key sequence for font size:
-  {"action": "hotkey", "keys": ["alt", "h"]},
-  {"action": "wait", "seconds": 0.3},
-  {"action": "hotkey", "keys": ["f", "s"]},
-  {"action": "wait", "seconds": 0.3},
-  {"action": "hotkey", "keys": ["ctrl", "a"]},
-  {"action": "type_text", "text": "14"},
-  {"action": "press_key", "keys": ["enter"]}
-
-── FONT FAMILY ──
-Change font to Arial:
-  {"action": "hotkey", "keys": ["alt", "h"]},
-  {"action": "wait", "seconds": 0.3},
-  {"action": "hotkey", "keys": ["f", "f"]},
-  {"action": "wait", "seconds": 0.3},
-  {"action": "hotkey", "keys": ["ctrl", "a"]},
-  {"action": "type_text", "text": "Arial"},
-  {"action": "press_key", "keys": ["enter"]}
-
-── FONT COLOR ──
-Font color via Format Cells (Ctrl+1 → Font tab → Color):
-  {"action": "hotkey", "keys": ["ctrl", "1"]},
-  {"action": "wait", "seconds": 0.6},
-  {"action": "hotkey", "keys": ["ctrl", "tab"]},   ← navigate to Font tab if needed
-  → Then user must pick color manually (color picker needs mouse)
-  
-  Faster — ribbon font color dropdown arrow:
-  {"action": "hotkey", "keys": ["alt", "h"]},
-  {"action": "wait", "seconds": 0.3},
-  {"action": "hotkey", "keys": ["f", "c"]},   ← applies LAST USED font color instantly
-  (To change the color, the user must click the dropdown arrow — keyboard-only is limited)
-
-── CELL BACKGROUND / FILL COLOR ──
-Apply last-used fill color:
-  {"action": "hotkey", "keys": ["alt", "h"]},
-  {"action": "wait", "seconds": 0.3},
-  {"action": "hotkey", "keys": ["h"]},          ← Highlight Color (fill)
-
-── COLUMN WIDTH ──
-AutoFit column width (fits content automatically):
-  {"action": "hotkey", "keys": ["alt", "h"]},
-  {"action": "wait", "seconds": 0.3},
-  {"action": "hotkey", "keys": ["o"]},
-  {"action": "wait", "seconds": 0.2},
-  {"action": "hotkey", "keys": ["i"]}
-  Full: Alt+H, O, I
-
-Set specific column width (e.g. 20):
-  {"action": "hotkey", "keys": ["alt", "h"]},
-  {"action": "wait", "seconds": 0.3},
-  {"action": "hotkey", "keys": ["o"]},
-  {"action": "wait", "seconds": 0.2},
-  {"action": "hotkey", "keys": ["w"]},
-  {"action": "wait", "seconds": 0.4},
-  {"action": "type_text", "text": "20"},
-  {"action": "press_key", "keys": ["enter"]}
-
-── ROW HEIGHT ──
-AutoFit row height:
-  Alt+H, O, A  (same menu as column width)
-  {"action": "hotkey", "keys": ["alt", "h"]},
-  {"action": "wait", "seconds": 0.3},
-  {"action": "hotkey", "keys": ["o"]},
-  {"action": "wait", "seconds": 0.2},
-  {"action": "hotkey", "keys": ["a"]}
-
-── ALIGNMENT ──
-Center:        Ctrl+E
-Left:          Ctrl+L  
-Right:         Ctrl+R  (NOTE: also activates fill-right — use in cell context only)
-Middle align:  Alt+H then A then M
-Top align:     Alt+H then A then T
-Bottom align:  Alt+H then A then B
-Wrap text:     Alt+H then W
-Merge & Center: Alt+H then M then M (requires_confirmation: true — destructive)
-
-── BORDERS ──
-All borders:    Alt+H then B then A
-Outer border:   Alt+H then B then S
-Thick box:      Alt+H then B then T
-No border:      Alt+H then B then N
-
-── NUMBERS / FORMAT ──
-Format Cells dialog:  Ctrl+1
-Currency format:       Ctrl+Shift+4  (i.e. $)
-Percentage format:     Ctrl+Shift+5
-Number format (2dp):   Ctrl+Shift+1
-Date format:           Ctrl+Shift+3
-Time format:           Ctrl+Shift+2
-General format:        Ctrl+Shift+~
-
-── NAVIGATION ──
-Go to cell (e.g. A1):   Ctrl+G → type cell ref → Enter
-                         OR: Ctrl+Home for A1
-Next sheet:             Ctrl+PageDown
-Previous sheet:         Ctrl+PageUp
-Last used cell:         Ctrl+End
-First cell:             Ctrl+Home
-Move right:             Tab
-Move down:              Enter
-Select entire row:      Shift+Space
-Select entire column:   Ctrl+Space (conflicts with Sutra hotkey — use ribbon instead)
-Select to end of data:  Ctrl+Shift+End
-
-── ROWS & COLUMNS ──
-Insert row:     Select row (Shift+Space) → Ctrl+Shift++
-Delete row:     Select row (Shift+Space) → Ctrl+- (requires_confirmation: true)
-Insert column:  Select column → Ctrl+Shift++
-Delete column:  Select column → Ctrl+- (requires_confirmation: true)
-Hide row:       Ctrl+9
-Unhide row:     Ctrl+Shift+9
-Hide column:    Ctrl+0
-Unhide column:  Ctrl+Shift+0
-
-── EDITING ──
-Edit cell:      F2
-Delete content: Delete
-Clear cell:     Delete (requires_confirmation: true if range selected)
-Undo:           Ctrl+Z
-Redo:           Ctrl+Y
-Copy:           Ctrl+C
-Cut:            Ctrl+X
-Paste:          Ctrl+V
-Paste Special:  Ctrl+Alt+V
-Fill down:      Ctrl+D
-Fill right:     Ctrl+R
-Find:           Ctrl+F
-Replace:        Ctrl+H
-AutoSum:        Alt+=
-
-── FORMULAS ──
-Enter formula mode: type "=" then formula then Enter
-SUM example:   type_text "=SUM(A1:A10)" then press_key enter
-AVERAGE:       type_text "=AVERAGE(A1:A10)" then press_key enter
-IF formula:    type_text "=IF(A1>0,\"Yes\",\"No\")" then press_key enter
-
-── TABLES & DATA ──
-Create table:         Ctrl+T
-Toggle filter:        Ctrl+Shift+L
-Sort ascending:       Alt+A then S+A
-Sort descending:      Alt+A then S+D
-Remove duplicates:    Alt+A then M
-
-── WORKBOOK ──
-Save:           Ctrl+S
-Save As:        F12
-New workbook:   Ctrl+N
-Open:           Ctrl+O
-Print:          Ctrl+P
-Close:          Ctrl+W
-New sheet:      Shift+F11
-
-── CHARTS ──
-Insert chart (from selected data): Alt+F1 (embedded) or F11 (new sheet)
-
-═══════════════════════════════════════════════════════════
-IMPORTANT RULES:
-1. Always add {"action": "wait", "seconds": 0.3} between ribbon key sequences (Alt+H, then next key)
-2. For multi-key ribbon sequences (Alt+H then F then S), each key is a SEPARATE step
-3. If the command is ambiguous or you are not sure what cell/range is selected, 
-   add a note in the plan but still attempt the best interpretation
-4. requires_confirmation must be true for: delete row/column, clear all, merge cells, close without save
-5. If command is completely unclear: return steps:[] and explain in plan
-6. NEVER guess random coordinates — only use hotkeys and keyboard navigation
-═══════════════════════════════════════════════════════════
-
-EXAMPLES:
-
-User: "increase font size to 16"
-{
-  "plan": "Change font size to 16 using Home ribbon shortcut",
-  "requires_confirmation": false,
-  "steps": [
-    {"action": "hotkey", "keys": ["alt", "h"]},
-    {"action": "wait", "seconds": 0.3},
-    {"action": "hotkey", "keys": ["f", "s"]},
-    {"action": "wait", "seconds": 0.3},
-    {"action": "hotkey", "keys": ["ctrl", "a"]},
-    {"action": "type_text", "text": "16"},
-    {"action": "press_key", "keys": ["enter"]}
-  ]
-}
-
-User: "auto fit column width"
-{
-  "plan": "AutoFit column width to fit content",
-  "requires_confirmation": false,
-  "steps": [
-    {"action": "hotkey", "keys": ["alt", "h"]},
-    {"action": "wait", "seconds": 0.3},
-    {"action": "hotkey", "keys": ["o"]},
-    {"action": "wait", "seconds": 0.2},
-    {"action": "hotkey", "keys": ["i"]}
-  ]
-}
-
-User: "make this bold and center it"
-{
-  "plan": "Apply bold formatting and center-align the selected cell",
+  "plan": "Short description of what you will do",
   "requires_confirmation": false,
   "steps": [
     {"action": "hotkey", "keys": ["ctrl", "b"]},
-    {"action": "wait", "seconds": 0.2},
-    {"action": "hotkey", "keys": ["ctrl", "e"]}
+    {"action": "ribbon", "keys": ["h", "f", "s"]},
+    {"action": "type_text", "text": "hello"},
+    {"action": "press_key", "key": "enter"},
+    {"action": "wait", "seconds": 0.4}
   ]
 }
 
-User: "delete this row"
-{
-  "plan": "Delete the currently selected row",
-  "requires_confirmation": true,
-  "steps": [
-    {"action": "hotkey", "keys": ["shift", "space"]},
-    {"action": "wait", "seconds": 0.2},
-    {"action": "hotkey", "keys": ["ctrl", "-"]}
-  ]
-}
+ACTION TYPES — use exactly these:
+• hotkey      → simultaneous key press: {"action":"hotkey","keys":["ctrl","b"]}
+• ribbon      → sequential ribbon key presses after Alt is already pressed: {"action":"ribbon","keys":["h","f","s"]}
+  (ribbon presses keys one-by-one with 80ms gap — for Excel ribbon navigation)
+• press_key   → single key press: {"action":"press_key","key":"enter"}
+• type_text   → type text string: {"action":"type_text","text":"Arial"}
+• wait        → pause: {"action":"wait","seconds":0.4}
 
-User: "change font to Times New Roman"
-{
-  "plan": "Change font family to Times New Roman",
-  "requires_confirmation": false,
-  "steps": [
-    {"action": "hotkey", "keys": ["alt", "h"]},
-    {"action": "wait", "seconds": 0.3},
-    {"action": "hotkey", "keys": ["f", "f"]},
-    {"action": "wait", "seconds": 0.3},
-    {"action": "hotkey", "keys": ["ctrl", "a"]},
-    {"action": "type_text", "text": "Times New Roman"},
-    {"action": "press_key", "keys": ["enter"]}
-  ]
-}
+═══════════════ EXCEL COMPLETE KEYBOARD MAP ═══════════════
+
+▌HOME TAB (Alt+H prefix, then ribbon keys)
+Bold              → hotkey ctrl+b
+Italic            → hotkey ctrl+i
+Underline         → hotkey ctrl+u
+Strikethrough     → hotkey ctrl+5
+Font size         → hotkey alt+h, wait 0.3, ribbon ["f","s"], wait 0.3, hotkey ctrl+a, type_text "14", press_key enter
+Font family       → hotkey alt+h, wait 0.3, ribbon ["f","f"], wait 0.3, hotkey ctrl+a, type_text "Arial", press_key enter
+Font color        → hotkey alt+h, wait 0.3, ribbon ["f","c"]   (applies last-used color)
+Fill/bg color     → hotkey alt+h, wait 0.3, ribbon ["h"]       (applies last-used fill)
+Clear formats     → hotkey alt+h, wait 0.3, ribbon ["e","f"]
+Clear all         → hotkey alt+h, wait 0.3, ribbon ["e","a"]   (requires_confirmation)
+Clear contents    → press_key delete
+
+Align left        → hotkey ctrl+l
+Align center      → hotkey ctrl+e
+Align right       → hotkey alt+h, wait 0.3, ribbon ["a","r"]   (NOT ctrl+r — fills right)
+Align top         → hotkey alt+h, wait 0.3, ribbon ["a","t"]
+Align middle      → hotkey alt+h, wait 0.3, ribbon ["a","m"]
+Align bottom      → hotkey alt+h, wait 0.3, ribbon ["a","b"]
+Wrap text         → hotkey alt+h, wait 0.3, ribbon ["w"]
+Merge & Center    → hotkey alt+h, wait 0.3, ribbon ["m","c"]   (requires_confirmation)
+Merge cells only  → hotkey alt+h, wait 0.3, ribbon ["m","m"]   (requires_confirmation)
+Unmerge           → hotkey alt+h, wait 0.3, ribbon ["m","u"]
+
+Increase indent   → hotkey alt+h, wait 0.3, ribbon ["6"]
+Decrease indent   → hotkey alt+h, wait 0.3, ribbon ["5"]
+Text direction    → hotkey alt+h, wait 0.3, ribbon ["f","q"]
+
+Number format General      → hotkey ctrl+shift+~
+Number format Number(2dp)  → hotkey ctrl+shift+1
+Number format Currency     → hotkey ctrl+shift+4
+Number format Percentage   → hotkey ctrl+shift+5
+Number format Date         → hotkey ctrl+shift+3
+Number format Time         → hotkey ctrl+shift+2
+Number format Scientific   → hotkey ctrl+shift+6
+Format Cells dialog        → hotkey ctrl+1
+
+Increase font size (+1pt)  → hotkey alt+h, wait 0.3, ribbon ["f","g"]
+Decrease font size (-1pt)  → hotkey alt+h, wait 0.3, ribbon ["f","k"]
+
+Borders all       → hotkey alt+h, wait 0.3, ribbon ["b","a"]
+Borders outside   → hotkey alt+h, wait 0.3, ribbon ["b","s"]
+Borders thick box → hotkey alt+h, wait 0.3, ribbon ["b","t"]
+Borders bottom    → hotkey alt+h, wait 0.3, ribbon ["b","o"]
+Borders top       → hotkey alt+h, wait 0.3, ribbon ["b","p"]
+Borders none      → hotkey alt+h, wait 0.3, ribbon ["b","n"]
+
+AutoFit col width → hotkey alt+h, wait 0.3, ribbon ["o","i"]
+AutoFit row height→ hotkey alt+h, wait 0.3, ribbon ["o","a"]
+Set col width     → hotkey alt+h, wait 0.3, ribbon ["o","w"], wait 0.4, type_text "20", press_key enter
+Set row height    → hotkey alt+h, wait 0.3, ribbon ["o","h"], wait 0.4, type_text "30", press_key enter
+
+AutoSum           → hotkey alt+=
+Fill down         → hotkey ctrl+d
+Fill right        → hotkey ctrl+r
+Find              → hotkey ctrl+f
+Replace           → hotkey ctrl+h
+Sort ascending    → hotkey alt+a, wait 0.3, ribbon ["s","a"]
+Sort descending   → hotkey alt+a, wait 0.3, ribbon ["s","d"]
+Filter toggle     → hotkey ctrl+shift+l
+Remove duplicates → hotkey alt+a, wait 0.3, ribbon ["m"]
+
+▌INSERT TAB (Alt+N prefix)
+Insert table      → hotkey ctrl+t
+Insert chart      → hotkey alt+f1   (embedded) / press_key f11 (new sheet)
+Insert PivotTable → hotkey alt+n, wait 0.3, ribbon ["v"]
+Insert function   → hotkey shift+f3
+Insert hyperlink  → hotkey ctrl+k
+Insert comment    → hotkey shift+f2
+Insert picture    → hotkey alt+n, wait 0.3, ribbon ["p","i"]
+Insert shapes     → hotkey alt+n, wait 0.3, ribbon ["s","h"]
+Insert sparkline  → hotkey alt+n, wait 0.3, ribbon ["s","n","l"]
+Insert header/footer → hotkey alt+n, wait 0.3, ribbon ["h"]
+Insert text box   → hotkey alt+n, wait 0.3, ribbon ["x"]
+Insert WordArt    → hotkey alt+n, wait 0.3, ribbon ["w"]
+New sheet         → hotkey shift+f11
+
+▌PAGE LAYOUT TAB (Alt+P prefix)
+Margins           → hotkey alt+p, wait 0.3, ribbon ["m"]
+Orientation portrait  → hotkey alt+p, wait 0.3, ribbon ["o","r"]
+Orientation landscape → hotkey alt+p, wait 0.3, ribbon ["o","l"]
+Paper size        → hotkey alt+p, wait 0.3, ribbon ["s","z"]
+Print area set    → hotkey alt+p, wait 0.3, ribbon ["r","s"]
+Print area clear  → hotkey alt+p, wait 0.3, ribbon ["r","c"]
+Page breaks       → hotkey alt+p, wait 0.3, ribbon ["b"]
+Scale width       → hotkey alt+p, wait 0.3, ribbon ["s","w"]
+Scale height      → hotkey alt+p, wait 0.3, ribbon ["s","t"]
+Grid lines show   → hotkey alt+p, wait 0.3, ribbon ["v","g"]
+Grid lines print  → hotkey alt+p, wait 0.3, ribbon ["i","g"]
+Headings show     → hotkey alt+p, wait 0.3, ribbon ["v","h"]
+Freeze panes      → hotkey alt+w, wait 0.3, ribbon ["f","f"]
+Unfreeze panes    → hotkey alt+w, wait 0.3, ribbon ["f","f"]   (same toggle)
+Split view        → hotkey alt+w, wait 0.3, ribbon ["s"]
+Zoom to selection → hotkey alt+w, wait 0.3, ribbon ["g"]
+
+▌FORMULAS TAB (Alt+M prefix)
+Insert function   → hotkey shift+f3
+AutoSum           → hotkey alt+=
+Name manager      → hotkey ctrl+f3
+Define name       → hotkey ctrl+shift+f3
+Trace precedents  → hotkey alt+m, wait 0.3, ribbon ["p"]
+Trace dependents  → hotkey alt+m, wait 0.3, ribbon ["d"]
+Show formulas     → hotkey ctrl+`
+Calculate now     → press_key f9
+Calculate sheet   → hotkey shift+f9
+
+▌DATA TAB (Alt+A prefix)
+Sort A-Z          → hotkey alt+a, wait 0.3, ribbon ["s","a"]
+Sort Z-A          → hotkey alt+a, wait 0.3, ribbon ["s","d"]
+Filter            → hotkey ctrl+shift+l
+Text to columns   → hotkey alt+a, wait 0.3, ribbon ["e"]
+Remove duplicates → hotkey alt+a, wait 0.3, ribbon ["m"]
+Data validation   → hotkey alt+a, wait 0.3, ribbon ["v","v"]
+Group rows        → hotkey alt+shift+right
+Ungroup rows      → hotkey alt+shift+left
+Subtotal          → hotkey alt+a, wait 0.3, ribbon ["b"]
+Flash fill        → hotkey ctrl+e
+Refresh data      → hotkey ctrl+alt+f5
+
+▌REVIEW TAB (Alt+R prefix)
+Spell check       → press_key f7
+Smart lookup      → hotkey alt+r, wait 0.3, ribbon ["r","l"]
+Thesaurus         → hotkey shift+f7
+Protect sheet     → hotkey alt+r, wait 0.3, ribbon ["p","s"]
+Protect workbook  → hotkey alt+r, wait 0.3, ribbon ["p","w"]
+Track changes     → hotkey alt+r, wait 0.3, ribbon ["g"]
+New comment       → hotkey shift+f2
+Delete comment    → hotkey alt+r, wait 0.3, ribbon ["d","d"]
+
+▌VIEW TAB (Alt+W prefix)
+Normal view       → hotkey alt+w, wait 0.3, ribbon ["l"]
+Page Layout view  → hotkey alt+w, wait 0.3, ribbon ["p"]
+Page Break view   → hotkey alt+w, wait 0.3, ribbon ["i"]
+Freeze panes      → hotkey alt+w, wait 0.3, ribbon ["f","f"]
+Split             → hotkey alt+w, wait 0.3, ribbon ["s"]
+Hide/Show gridlines → hotkey alt+w, wait 0.3, ribbon ["v","g"]
+Zoom in           → hotkey alt+w, wait 0.3, ribbon ["q"]
+100% zoom         → hotkey alt+w, wait 0.3, ribbon ["j"]
+
+▌NAVIGATION
+Go to cell        → hotkey ctrl+g, wait 0.4, type_text "A1", press_key enter
+Cell A1           → hotkey ctrl+home
+Last cell         → hotkey ctrl+end
+Next sheet        → hotkey ctrl+pagedown
+Previous sheet    → hotkey ctrl+pageup
+Select all        → hotkey ctrl+a
+Select row        → hotkey shift+space
+Select col        → hotkey ctrl+space
+Extend selection  → hotkey shift+[arrow key]
+
+▌ROWS & COLUMNS
+Insert row        → hotkey shift+space, wait 0.2, hotkey ctrl+shift+=
+Delete row        → hotkey shift+space, wait 0.2, hotkey ctrl+- (requires_confirmation)
+Insert column     → hotkey ctrl+space, wait 0.2, hotkey ctrl+shift+=
+Delete column     → hotkey ctrl+space, wait 0.2, hotkey ctrl+- (requires_confirmation)
+Hide row          → hotkey ctrl+9
+Unhide row        → hotkey ctrl+shift+9
+Hide column       → hotkey ctrl+0
+Unhide column     → hotkey ctrl+shift+0
+
+▌EDITING
+Edit cell         → press_key f2
+Copy              → hotkey ctrl+c
+Cut               → hotkey ctrl+x
+Paste             → hotkey ctrl+v
+Paste special     → hotkey ctrl+alt+v
+Undo              → hotkey ctrl+z
+Redo              → hotkey ctrl+y
+Save              → hotkey ctrl+s
+Save as           → press_key f12
+
+═══════════════ RULES ═══════════════
+1. ribbon action = sequential key presses after Alt has been pressed. ALWAYS use ribbon for Alt+letter+letter sequences.
+2. NEVER use hotkey for more than 3 keys simultaneously (ctrl+shift+key is fine; ctrl+alt+shift+key is not).
+3. ALWAYS add {"action":"wait","seconds":0.3} after ANY hotkey that opens a tab (alt+h, alt+n, alt+p etc.)
+4. For font size/family: ALWAYS use ctrl+a to select all text in the input box before typing the value.
+5. requires_confirmation=true for: delete row/col, merge cells, clear all, close without save, protect.
+6. If unclear: return steps:[] and explain in plan what info you need.
+7. Wrap text = ribbon ["w"] after alt+h. Merge = ribbon ["m","c"] after alt+h. These are NEVER ctrl shortcuts.
+
+═══════════════ VERIFIED EXAMPLES ═══════════════
+
+"wrap text" or "text wrap karo":
+{"plan":"Wrap text in selected cell(s)","requires_confirmation":false,"steps":[
+  {"action":"hotkey","keys":["alt","h"]},{"action":"wait","seconds":0.3},{"action":"ribbon","keys":["w"]}
+]}
+
+"merge and center" or "merge center karo":
+{"plan":"Merge and center selected cells","requires_confirmation":true,"steps":[
+  {"action":"hotkey","keys":["alt","h"]},{"action":"wait","seconds":0.3},{"action":"ribbon","keys":["m","c"]}
+]}
+
+"autofit column width" or "column width badao":
+{"plan":"AutoFit column width to fit content","requires_confirmation":false,"steps":[
+  {"action":"hotkey","keys":["alt","h"]},{"action":"wait","seconds":0.3},{"action":"ribbon","keys":["o","i"]}
+]}
+
+"increase column width to 25" or "column width 25 karo":
+{"plan":"Set column width to 25","requires_confirmation":false,"steps":[
+  {"action":"hotkey","keys":["alt","h"]},{"action":"wait","seconds":0.3},
+  {"action":"ribbon","keys":["o","w"]},{"action":"wait","seconds":0.4},
+  {"action":"type_text","text":"25"},{"action":"press_key","key":"enter"}
+]}
+
+"increase row height to 30":
+{"plan":"Set row height to 30","requires_confirmation":false,"steps":[
+  {"action":"hotkey","keys":["alt","h"]},{"action":"wait","seconds":0.3},
+  {"action":"ribbon","keys":["o","h"]},{"action":"wait","seconds":0.4},
+  {"action":"type_text","text":"30"},{"action":"press_key","key":"enter"}
+]}
+
+"font size 16 karo" or "increase font size to 16":
+{"plan":"Set font size to 16","requires_confirmation":false,"steps":[
+  {"action":"hotkey","keys":["alt","h"]},{"action":"wait","seconds":0.3},
+  {"action":"ribbon","keys":["f","s"]},{"action":"wait","seconds":0.3},
+  {"action":"hotkey","keys":["ctrl","a"]},{"action":"type_text","text":"16"},
+  {"action":"press_key","key":"enter"}
+]}
+
+"bold and center" or "bold aur center karo":
+{"plan":"Bold and center-align selected cell","requires_confirmation":false,"steps":[
+  {"action":"hotkey","keys":["ctrl","b"]},{"action":"wait","seconds":0.2},
+  {"action":"hotkey","keys":["ctrl","e"]}
+]}
+
+"all borders lagao":
+{"plan":"Apply all borders to selected cells","requires_confirmation":false,"steps":[
+  {"action":"hotkey","keys":["alt","h"]},{"action":"wait","seconds":0.3},
+  {"action":"ribbon","keys":["b","a"]}
+]}
+
+"freeze first row" or "pehli row freeze karo":
+{"plan":"Freeze the top row","requires_confirmation":false,"steps":[
+  {"action":"hotkey","keys":["alt","w"]},{"action":"wait","seconds":0.3},
+  {"action":"ribbon","keys":["f","r"]}
+]}
 """
 
 DEFAULT_ERROR_PLAN: dict = {
@@ -327,28 +402,55 @@ DEFAULT_ERROR_PLAN: dict = {
 
 
 class N8NClient:
-    """Multi-provider LLM planner. Tries Groq → Gemini → n8n in order."""
+    """Multi-provider LLM planner with live provider switching and usage tracking."""
 
     def __init__(self, webhook_url: Optional[str] = None) -> None:
         self.webhook_url: str = webhook_url or N8N_WEBHOOK_URL
 
-    # ── Public API ────────────────────────────────────────────────────────────
-
     def send_command(self, user_text: str, context: str = "") -> dict:
-        """Plan an action for user_text, injecting memory context."""
-        provider = LLM_PROVIDER.lower()
+        provider = provider_config.provider
 
-        if provider == "groq" and GROQ_API_KEY:
-            result = self._call_groq(user_text, context)
-            if result:
-                return result
-            logger.warning("Groq failed, falling back to Gemini")
+        if provider == "groq":
+            result = self._call_openai_compat(
+                url=GROQ_URL,
+                key=provider_config.keys.get("groq", ""),
+                model="llama-3.3-70b-versatile",
+                user_text=user_text,
+                context=context,
+                provider_name="groq",
+                force_json=True,
+            )
+            if result: return result
+            logger.warning("Groq failed, trying Gemini")
 
-        if GEMINI_API_KEY:
+        if provider in ("gemini", "groq"):
             result = self._call_gemini(user_text, context)
-            if result:
-                return result
-            logger.warning("Gemini failed, falling back to n8n")
+            if result: return result
+            logger.warning("Gemini failed, trying n8n")
+
+        if provider == "openai":
+            result = self._call_openai_compat(
+                url=OPENAI_URL,
+                key=provider_config.keys.get("openai", ""),
+                model="gpt-4o-mini",
+                user_text=user_text,
+                context=context,
+                provider_name="openai",
+                force_json=True,
+            )
+            if result: return result
+
+        if provider == "custom":
+            result = self._call_openai_compat(
+                url=provider_config.custom_url,
+                key=provider_config.keys.get("custom", ""),
+                model=provider_config.custom_model,
+                user_text=user_text,
+                context=context,
+                provider_name="custom",
+                force_json=False,
+            )
+            if result: return result
 
         return self._call_n8n(user_text, context)
 
@@ -358,45 +460,57 @@ class N8NClient:
         except Exception:
             return False
 
-    # ── Providers ────────────────────────────────────────────────────────────
-
     def _build_user_message(self, user_text: str, context: str) -> str:
         msg = ""
         if context:
-            msg += f"[User preferences/memory]\n{context}\n\n"
+            msg += f"[User preferences]\n{context}\n\n"
         msg += f"User command: {user_text}"
         return msg
 
-    def _call_groq(self, user_text: str, context: str) -> Optional[dict]:
-        """Call Groq API (Llama 3.3 70B) — fast, free, reliable."""
-        headers = {
-            "Authorization": f"Bearer {GROQ_API_KEY}",
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "model": GROQ_MODEL,
+    def _call_openai_compat(
+        self, url: str, key: str, model: str,
+        user_text: str, context: str, provider_name: str,
+        force_json: bool = False,
+    ) -> Optional[dict]:
+        if not url or not key:
+            logger.warning("%s: missing URL or key", provider_name)
+            return None
+        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+        payload: dict = {
+            "model": model,
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user",   "content": self._build_user_message(user_text, context)},
             ],
             "temperature": 0.1,
             "max_tokens": 1024,
-            "response_format": {"type": "json_object"},  # forces valid JSON
         }
+        if force_json:
+            payload["response_format"] = {"type": "json_object"}
         try:
-            logger.info("Calling Groq (%s) for: %s", GROQ_MODEL, user_text)
-            r = requests.post(GROQ_URL, headers=headers, json=payload, timeout=15)
+            logger.info("Calling %s (%s) for: %s", provider_name, model, user_text)
+            r = requests.post(url, headers=headers, json=payload, timeout=20)
             r.raise_for_status()
-            raw = r.json()["choices"][0]["message"]["content"]
+            data = r.json()
+            raw = data["choices"][0]["message"]["content"]
+            # Track usage
+            usage_data = data.get("usage", {})
+            usage.record(
+                provider_name,
+                usage_data.get("prompt_tokens", len(user_text) // 4),
+                usage_data.get("completion_tokens", len(raw) // 4),
+            )
             return self._parse_plan(raw)
         except requests.exceptions.HTTPError as e:
-            logger.error("Groq HTTP %s: %s", e.response.status_code if e.response else "?", e)
+            logger.error("%s HTTP %s: %s", provider_name, e.response.status_code if e.response else "?", e)
         except Exception as e:
-            logger.error("Groq call failed: %s", e)
+            logger.error("%s call failed: %s", provider_name, e)
         return None
 
     def _call_gemini(self, user_text: str, context: str) -> Optional[dict]:
-        """Call Gemini 2.5 Flash directly."""
+        key = provider_config.keys.get("gemini", GEMINI_API_KEY)
+        if not key:
+            return None
         full_prompt = SYSTEM_PROMPT + "\n\n" + self._build_user_message(user_text, context)
         payload = {
             "contents": [{"parts": [{"text": full_prompt}]}],
@@ -404,12 +518,16 @@ class N8NClient:
         }
         try:
             logger.info("Calling Gemini for: %s", user_text)
-            r = requests.post(
-                f"{GEMINI_URL}?key={GEMINI_API_KEY}",
-                json=payload, timeout=20,
-            )
+            r = requests.post(f"{GEMINI_URL}?key={key}", json=payload, timeout=20)
             r.raise_for_status()
-            raw = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+            data = r.json()
+            raw = data["candidates"][0]["content"]["parts"][0]["text"]
+            # Gemini doesn't return token counts in same format; estimate
+            meta = data.get("usageMetadata", {})
+            usage.record("gemini",
+                meta.get("promptTokenCount", len(user_text) // 4),
+                meta.get("candidatesTokenCount", len(raw) // 4),
+            )
             return self._parse_plan(raw)
         except requests.exceptions.HTTPError as e:
             logger.error("Gemini HTTP %s: %s", e.response.status_code if e.response else "?", e)
@@ -418,7 +536,6 @@ class N8NClient:
         return None
 
     def _call_n8n(self, user_text: str, context: str) -> dict:
-        """Fallback: n8n webhook."""
         payload = {"user_text": user_text, "context": context, "timestamp": datetime.now().isoformat()}
         try:
             r = requests.post(self.webhook_url, json=payload, timeout=N8N_TIMEOUT)
@@ -427,7 +544,7 @@ class N8NClient:
                 return DEFAULT_ERROR_PLAN
             result = r.json()
             return {
-                "plan": result.get("plan", "Executing command..."),
+                "plan": result.get("plan", "Executing..."),
                 "requires_confirmation": result.get("requires_confirmation", False),
                 "steps": result.get("steps", []),
             }
@@ -436,9 +553,9 @@ class N8NClient:
             return DEFAULT_ERROR_PLAN
 
     def _parse_plan(self, raw: str) -> Optional[dict]:
-        """Parse and validate the LLM JSON response."""
         try:
             cleaned = re.sub(r"```json\n?", "", raw).replace("```", "").strip()
+            # Sometimes model wraps in outer object key
             parsed = json.loads(cleaned)
             plan = {
                 "plan": parsed.get("plan", "Executing command..."),
@@ -448,29 +565,29 @@ class N8NClient:
             logger.info("Plan: %s (%d steps)", plan["plan"], len(plan["steps"]))
             return plan
         except (json.JSONDecodeError, KeyError) as e:
-            logger.error("Failed to parse LLM response: %s | raw: %s", e, raw[:300])
+            logger.error("Parse failed: %s | raw: %.200s", e, raw)
             return None
 
 
 # ── Standalone test ───────────────────────────────────────────────────────────
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s — %(message)s")
-
     client = N8NClient()
     tests = [
-        "Make the title bold",
-        "Increase font size to 16",
-        "AutoFit column width",
-        "Change font to Arial",
-        "Add a new row",
-        "Delete this row",
-        "Center align the text",
-        "Change font size to 14 and make it italic",
+        "wrap text karo",
+        "merge and center",
+        "autofit column width",
+        "increase column width to 25",
+        "set row height to 30",
+        "font size 16 karo",
+        "bold aur center align",
+        "all borders lagao",
+        "freeze top row",
     ]
-
-    print(f"\nUsing provider: {LLM_PROVIDER}\n" + "=" * 55)
+    print(f"\nProvider: {provider_config.provider}\n" + "=" * 60)
     for cmd in tests:
-        print(f"\nCommand: {cmd!r}")
         plan = client.send_command(cmd)
-        print(f"Plan:    {plan['plan']}")
-        print(f"Steps:   {json.dumps(plan['steps'], separators=(',', ':'))}")
+        print(f"\n{cmd!r}")
+        print(f"  → {plan['plan']}")
+        for s in plan["steps"]:
+            print(f"     {s}")
