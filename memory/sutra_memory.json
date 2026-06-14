@@ -17,7 +17,31 @@
       "user_id": "default",
       "created": "2026-06-14T09:11:29.247429",
       "source": "command: Make the font of the selected cell Times New Roman"
+    },
+    {
+      "fact": "User often uses bold formatting",
+      "user_id": "default",
+      "created": "2026-06-14T09:40:49.533485",
+      "source": "command: In this selected cell, write the text of my favori"
+    },
+    {
+      "fact": "User prefers wrap text by default to display multiple lines of text",
+      "user_id": "default",
+      "created": "2026-06-14T09:45:31.545111",
+      "source": "command: Apply wrap text to the selected cell size by defau"
+    },
+    {
+      "fact": "User prefers text to be visible within a single cell",
+      "user_id": "default",
+      "created": "2026-06-14T09:46:59.327097",
+      "source": "command: This text is overlapping into another cell, right?"
+    },
+    {
+      "fact": "User likes to apply wrap text for better readability",
+      "user_id": "default",
+      "created": "2026-06-14T09:46:59.327539",
+      "source": "command: This text is overlapping into another cell, right?"
     }
   ],
-  "updated": "2026-06-14T09:11:29.248500"
+  "updated": "2026-06-14T09:46:59.329041"
 }

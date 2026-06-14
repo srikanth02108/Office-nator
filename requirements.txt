@@ -34,3 +34,6 @@ opencv-python
 fastapi
 uvicorn[standard]
 packaging
+
+# System tray + global hotkey
+pystray
