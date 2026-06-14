@@ -98,7 +98,7 @@ function KeyInput({
             if (e.key === "Escape") { setEditing(false); setVal("") }
           }}
           placeholder={`Paste ${label} API key…`}
-          className="w-full rounded-md border border-primary/40 bg-background/80 px-2 py-1.5 font-mono text-[10px] text-foreground outline-none placeholder:text-muted-foreground/60"
+          className="w-full rounded-md border border-primary/40 bg-[oklch(0.15_0.012_240)] px-2 py-1.5 font-mono text-[10px] text-foreground outline-none placeholder:text-muted-foreground/60"
         />
         <button
           type="button"
@@ -198,11 +198,12 @@ export function ProviderPanel({
               // fixed position so it never disturbs the page layout
               className={cn(
                 "fixed z-50 w-[22rem] rounded-2xl p-4 shadow-2xl",
-                "glass border border-border",
+                // fully opaque background — no bleed-through from content behind
+                "border border-border bg-[oklch(0.18_0.014_240)] backdrop-blur-none",
                 // position below the trigger — top bar is ~65px tall
                 "top-[68px] right-4",
               )}
-              style={{ maxHeight: "calc(100vh - 88px)", overflowY: "auto" }}
+              style={{ maxHeight: "calc(100vh - 88px)", overflowY: "auto", boxShadow: "0 8px 48px -4px rgba(0,0,0,0.8), 0 0 0 1px oklch(0.85 0.05 200 / 15%)" }}
             >
               {/* Header row */}
               <div className="mb-3 flex items-center justify-between">
@@ -233,8 +234,8 @@ export function ProviderPanel({
                       className={cn(
                         "rounded-xl border p-3 transition-colors",
                         isActive
-                          ? "border-primary/40 bg-primary/5"
-                          : "border-border bg-secondary/20",
+                          ? "border-primary/40 bg-[oklch(0.22_0.014_240)]"
+                          : "border-border bg-[oklch(0.20_0.014_240)] hover:bg-[oklch(0.22_0.014_240)]",
                       )}
                     >
                       {/* Top row — radio + labels + key button */}
@@ -290,13 +291,13 @@ export function ProviderPanel({
                             value={customUrl}
                             onChange={e => setCustomUrl(e.target.value)}
                             placeholder="Base URL  e.g. http://localhost:11434/v1"
-                            className="w-full rounded-md border border-border bg-background/60 px-2 py-1.5 font-mono text-[10px] text-foreground outline-none placeholder:text-muted-foreground/60"
+                            className="w-full rounded-md border border-border bg-[oklch(0.15_0.012_240)] px-2 py-1.5 font-mono text-[10px] text-foreground outline-none placeholder:text-muted-foreground/60"
                           />
                           <input
                             value={customModel}
                             onChange={e => setCustomModel(e.target.value)}
                             placeholder="Model name  e.g. llama3.2"
-                            className="w-full rounded-md border border-border bg-background/60 px-2 py-1.5 font-mono text-[10px] text-foreground outline-none placeholder:text-muted-foreground/60"
+                            className="w-full rounded-md border border-border bg-[oklch(0.15_0.012_240)] px-2 py-1.5 font-mono text-[10px] text-foreground outline-none placeholder:text-muted-foreground/60"
                           />
                           <button
                             onClick={() => {
