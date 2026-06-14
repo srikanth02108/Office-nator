@@ -2,6 +2,7 @@
 
 import { useState } from 'react'
 import Link from 'next/link'
+import { useRouter } from 'next/navigation'
 import { ArrowLeft, Bot, Loader2, Zap } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { FloatingInput } from '@/components/auth/floating-input'
@@ -11,78 +12,32 @@ type AuthFormProps = {
   mode: 'login' | 'register'
 }
 
-const MAIN_APP_URL = process.env.NEXT_PUBLIC_MAIN_APP_URL ?? 'http://localhost:3000'
+// Where the main Sutra app lives
+const MAIN_APP_URL =
+  process.env.NEXT_PUBLIC_MAIN_APP_URL ?? 'http://localhost:3000'
 
 export function AuthForm({ mode }: AuthFormProps) {
-  const [loading, setLoading]     = useState(false)
-  const [demoLoading, setDemo]    = useState(false)
-  const [error, setError]         = useState('')
-  const isRegister                = mode === 'register'
+  const router    = useRouter()
+  const [loading, setLoading]   = useState(false)
+  const [demoLoading, setDemo]  = useState(false)
+  const [success, setSuccess]   = useState(false)
+  const isRegister = mode === 'register'
 
-  // ── Normal submit ───────────────────────────────────────────────────
-  const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
+  // ── Static form submit (no real auth — just redirect) ─────────────
+  const handleSubmit = (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault()
-    setError('')
     setLoading(true)
-
-    const form  = e.currentTarget
-    const data  = new FormData(form)
-    const endpoint = isRegister ? '/api/auth/register' : '/api/auth/login'
-
-    const body = isRegister
-      ? {
-          username: data.get('username'),
-          email:    data.get('email'),
-          password: data.get('password'),
-        }
-      : {
-          email:    data.get('email'),
-          password: data.get('password'),
-        }
-
-    try {
-      const res = await fetch(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      })
-      const json = await res.json()
-
-      if (!res.ok) {
-        setError(json.error ?? 'Something went wrong.')
-        setLoading(false)
-        return
-      }
-
-      // Success → redirect to main app
-      window.location.href = MAIN_APP_URL
-    } catch {
-      setError('Network error. Is the server running?')
-      setLoading(false)
-    }
+    // Simulate a brief loading state then redirect
+    setTimeout(() => {
+      setSuccess(true)
+      setTimeout(() => { window.location.href = MAIN_APP_URL }, 600)
+    }, 900)
   }
 
-  // ── Demo login ──────────────────────────────────────────────────────
-  const handleDemo = async () => {
-    setError('')
+  // ── Demo login — instant redirect ─────────────────────────────────
+  const handleDemo = () => {
     setDemo(true)
-    try {
-      const res = await fetch('/api/auth/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ demo: true }),
-      })
-      const json = await res.json()
-      if (!res.ok) {
-        setError(json.error ?? 'Demo login failed.')
-        setDemo(false)
-        return
-      }
-      window.location.href = MAIN_APP_URL
-    } catch {
-      setError('Network error.')
-      setDemo(false)
-    }
+    setTimeout(() => { window.location.href = MAIN_APP_URL }, 600)
   }
 
   return (
@@ -103,7 +58,7 @@ export function AuthForm({ mode }: AuthFormProps) {
         </Link>
 
         <div className="glass rounded-2xl p-8 shadow-hard">
-          {/* Header */}
+          {/* Logo */}
           <div className="flex flex-col items-center text-center">
             <span className="flex size-11 items-center justify-center rounded-md border border-primary/40 bg-primary/10 text-primary shadow-glow">
               <Bot className="size-5" />
@@ -122,18 +77,16 @@ export function AuthForm({ mode }: AuthFormProps) {
               type="button"
               onClick={handleDemo}
               disabled={demoLoading || loading}
-              className="mt-6 flex w-full items-center justify-center gap-2.5 rounded-xl border border-primary/40 bg-primary/10 px-4 py-3 text-sm font-semibold text-primary transition-all hover:border-primary/70 hover:bg-primary/20 hover:shadow-[0_0_20px_-4px_var(--primary)] disabled:opacity-50"
+              className="mt-6 flex w-full items-center justify-center gap-2.5 rounded-xl border border-primary/40 bg-primary/10 px-4 py-3 text-sm font-semibold text-primary transition-all hover:border-primary/70 hover:bg-primary/20 hover:shadow-[0_0_20px_-4px_var(--primary)] disabled:opacity-60"
             >
-              {demoLoading ? (
-                <Loader2 className="size-4 animate-spin" />
-              ) : (
-                <Zap className="size-4" />
-              )}
-              {demoLoading ? 'Signing in…' : 'Try Demo — instant access'}
+              {demoLoading
+                ? <Loader2 className="size-4 animate-spin" />
+                : <Zap className="size-4" />}
+              {demoLoading ? 'Launching…' : 'Try Demo — instant access'}
             </button>
           )}
 
-          {/* Divider after demo button */}
+          {/* Divider */}
           {!isRegister && (
             <div className="my-5 flex items-center gap-3">
               <span className="h-px flex-1 bg-border" />
@@ -144,10 +97,10 @@ export function AuthForm({ mode }: AuthFormProps) {
             </div>
           )}
 
-          {/* Error message */}
-          {error && (
-            <div className="mb-4 rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-2.5 text-sm text-destructive">
-              {error}
+          {/* Success banner */}
+          {success && (
+            <div className="mb-4 rounded-lg border border-chart-2/30 bg-chart-2/10 px-4 py-2.5 text-sm text-chart-2">
+              ✓ {isRegister ? 'Account created!' : 'Signed in!'} Redirecting…
             </div>
           )}
 
@@ -157,20 +110,9 @@ export function AuthForm({ mode }: AuthFormProps) {
             className={`flex flex-col gap-4 ${isRegister ? 'mt-8' : ''}`}
           >
             {isRegister && (
-              <FloatingInput
-                name="username"
-                label="Username"
-                autoComplete="username"
-                required
-              />
+              <FloatingInput name="username" label="Username" autoComplete="username" required />
             )}
-            <FloatingInput
-              name="email"
-              type="email"
-              label="Email"
-              autoComplete="email"
-              required
-            />
+            <FloatingInput name="email" type="email" label="Email" autoComplete="email" required />
             <FloatingInput
               name="password"
               type="password"
@@ -187,7 +129,6 @@ export function AuthForm({ mode }: AuthFormProps) {
                 required
               />
             )}
-
             {isRegister && (
               <label className="flex items-start gap-2.5 text-xs text-muted-foreground">
                 <input
@@ -206,7 +147,7 @@ export function AuthForm({ mode }: AuthFormProps) {
 
             <Button
               type="submit"
-              disabled={loading || demoLoading}
+              disabled={loading || demoLoading || success}
               className="mt-2 h-11 shadow-glow"
             >
               {loading ? (
@@ -227,7 +168,7 @@ export function AuthForm({ mode }: AuthFormProps) {
           </div>
           <OAuthButtons />
 
-          {/* Switch link */}
+          {/* Switch */}
           <p className="mt-8 text-center text-sm text-muted-foreground">
             {isRegister ? (
               <>Already have an account?{' '}
