@@ -104,8 +104,12 @@ export function ProviderPanel({ provider, keysSet, usage, onSetProvider, onSetKe
   const [customModel, setCustomModel] = useState("")
   const [customKey,   setCustomKey]   = useState("")
 
+  // Guard against undefined during initial render before WS state arrives
+  const safeKeysSet = keysSet  ?? { groq: false, gemini: false, openai: false, custom: false }
+  const safeUsage   = usage    ?? {}
+
   const active = PROVIDERS.find(p => p.id === provider) ?? PROVIDERS[0]
-  const activeUsage = usage[provider] ?? { requests: 0, tokens_in: 0, tokens_out: 0, daily_request_limit: 0, usage_pct: 0 }
+  const activeUsage = safeUsage[provider] ?? { requests: 0, tokens_in: 0, tokens_out: 0, daily_request_limit: 0, usage_pct: 0 }
 
   return (
     <div className="relative">
@@ -137,7 +141,7 @@ export function ProviderPanel({ provider, keysSet, usage, onSetProvider, onSetKe
 
             <div className="space-y-2">
               {PROVIDERS.map(p => {
-                const u    = usage[p.id] ?? { requests: 0, usage_pct: 0, daily_request_limit: 0, tokens_in: 0, tokens_out: 0 }
+                const u    = safeUsage[p.id]   ?? { requests: 0, usage_pct: 0, daily_request_limit: 0, tokens_in: 0, tokens_out: 0 }
                 const isActive = p.id === provider
 
                 return (
@@ -167,13 +171,13 @@ export function ProviderPanel({ provider, keysSet, usage, onSetProvider, onSetKe
                       <KeyInput
                         provider={p.id}
                         label={p.label}
-                        hasKey={keysSet[p.id] ?? false}
+                        hasKey={safeKeysSet[p.id] ?? false}
                         onSave={key => onSetKey(p.id, key)}
                       />
                     </div>
 
                     {/* Usage bar (only if has key) */}
-                    {(keysSet[p.id] || isActive) && (
+                    {(safeKeysSet[p.id] || isActive) && (
                       <div className="mt-2">
                         <div className="flex items-center justify-between font-mono text-[9px] text-muted-foreground">
                           <span>{u.requests} req today</span>

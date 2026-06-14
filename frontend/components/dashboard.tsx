@@ -78,9 +78,9 @@ export function Dashboard() {
         <div className="flex items-center gap-2">
           {/* Live provider switcher with usage */}
           <ProviderPanel
-            provider={state.provider}
-            keysSet={state.keys_set}
-            usage={state.usage}
+            provider={state.provider ?? "groq"}
+            keysSet={state.keys_set  ?? { groq: false, gemini: false, openai: false, custom: false }}
+            usage={state.usage       ?? {}}
             onSetProvider={setProvider}
             onSetKey={setApiKey}
             onSetCustom={setCustomProvider}
